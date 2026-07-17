@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "can.h"
+#include "dma.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -38,8 +39,21 @@ volatile float motor_angle = 0;
 volatile float motor_speed = 0;
 volatile float motor_current = 0;
 volatile float motor_error = 0;
+volatile float expected_speed = 500;
+static float P_gain = 10.0f;     // 比例
+static float I_gain = 40.0f;      // 积分
+static float D_gain = 5.0f;      // 微分
+static float integral = 0.0f;
+static float prev_error = 0.0f;
 volatile uint8_t new_data_flag = 0;
+#define CH_COUNT  4   //发送的通道数
 
+#pragma pack(push, 1)
+typedef struct {
+  float fdata[CH_COUNT];
+  uint8_t tail[4];
+} JustFloatFrame;
+#pragma pack(pop)
 
 /* USER CODE END PD */
 
@@ -58,6 +72,7 @@ volatile uint8_t new_data_flag = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void C610_SendCurrent(uint8_t id, int16_t current);
+float PID_Calculate(float error);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -96,6 +111,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_CAN_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -132,31 +148,48 @@ int main(void)
     Error_Handler();
   }
 
-
-  printf("=== System Ready ===\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  int16_t current_cmd = 2000; // 2A 转矩电流
   uint32_t last_tick = 0;
+  JustFloatFrame txFrame = {
+    .tail = {0x00, 0x00, 0x80, 0x7f}
+  };
   while (1)
   {
-    // 每 10ms 发送一次控制指令
-    if (HAL_GetTick() - last_tick >= 10)
+    if (HAL_GetTick() - last_tick >= 1)
     {
       last_tick = HAL_GetTick();
+
+      float error = expected_speed - motor_speed;
+      float pid_out = PID_Calculate(error);
+      float current_cmd_f = pid_out; //* 1000.0f;
+      if (current_cmd_f >  3000) current_cmd_f =  3000;
+      if (current_cmd_f < -3000) current_cmd_f = -3000;
+      int16_t current_cmd = (int16_t)current_cmd_f;
+
       C610_SendCurrent(4, current_cmd);
+
+      HAL_UART_Transmit_DMA(&huart1, (uint8_t*)&txFrame, sizeof(JustFloatFrame));
     }
 
-    // 收到 CAN 报文则闪烁 LED 并打印数据
+    // 处理接收到的反馈（仅在收到新数据时执行）
     if (new_data_flag)
     {
-      new_data_flag = 0;
-      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);  // 闪烁 PC13 LED
-      printf("Angle:%.1f Speed:%.0f Current:%.2fA Error:%d\r\n",
-             motor_angle, motor_speed, motor_current, (int)motor_error);
+      new_data_flag = 0;                      // 清除标志
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // LED 闪烁指示接收
+
+      // printf("Angle:%.1f Speed:%.0f Current:%.2fA Error:%d\r\n",
+      //        motor_angle, motor_speed, motor_current, (int)motor_error);
+
+      // 发送给上位机
+      txFrame.fdata[0] = motor_angle;
+      txFrame.fdata[1] = motor_speed;
+      txFrame.fdata[2] = motor_current;
+      txFrame.fdata[3] = motor_error;
     }
+
     HAL_Delay(1);
     /* USER CODE END WHILE */
 
@@ -228,7 +261,26 @@ void C610_SendCurrent(uint8_t id, int16_t current)
 
   HAL_CAN_AddTxMessage(&hcan, &tx_header, tx_data, &tx_mailbox);
 }
+float PID_Calculate(float error) {
+  // 比例项
+  float P_term = P_gain * error;
 
+  // 积分项（采样周期 1ms = 0.001s）
+  integral += error * 0.001f;
+  // 积分限幅，防止饱和
+
+  float I_term = I_gain * integral;
+
+  if (I_term >  1500.0f) I_term =  1500.0f;
+  if (I_term < -1500.0f) I_term = -1500.0f;
+
+  // 微分项
+  float derivative = (error - prev_error) / 0.01f;
+  float D_term = D_gain * derivative;
+  prev_error = error;
+
+  return P_term + I_term + D_term;
+}
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
   if (hcan->Instance == CAN1)
@@ -246,9 +298,8 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
       int16_t actual_current = (rx_data[4] << 8) | rx_data[5];
       uint8_t error_code = rx_data[7];
 
-      // 存入全局变量
+      motor_speed = (float)speed/36.0f;
       motor_angle = (float)angle / 8191.0f * 360.0f;
-      motor_speed = (float)speed;
       motor_current = (float)actual_current / 1000.0f;
       motor_error = (float)error_code;
 
