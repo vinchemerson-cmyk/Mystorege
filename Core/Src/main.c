@@ -22,10 +22,11 @@
 #include "dma.h"
 #include "usart.h"
 #include "gpio.h"
-
+#include "math.h"
+#include "fastmath.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,18 +36,25 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-volatile float motor_angle = 0;
-volatile float motor_speed = 0;
-volatile float motor_current = 0;
-volatile float motor_error = 0;
-volatile float expected_speed = 500;
-static float P_gain = 10.0f;     // 比例
+volatile float motor_angle = 0.0f;
+volatile float motor_speed = 0.0f;
+volatile float motor_current = 0.0f;
+volatile float motor_error = 0.0f;
+
+// 已修复：全局变量初始化改为合法的常数 0.0f
+volatile float expected_speed = 0.0f;
+
+static float P_gain = 300.0f;     // 比例
 static float I_gain = 40.0f;      // 积分
 static float D_gain = 5.0f;      // 微分
 static float integral = 0.0f;
 static float prev_error = 0.0f;
 volatile uint8_t new_data_flag = 0;
-#define CH_COUNT  4   //发送的通道数
+
+#define TWOpai 6.283185307f
+#define AMPLITUDE 200.0f
+#define WAVELENGTH 2000
+#define CH_COUNT  4   // 发送的通道数
 
 #pragma pack(push, 1)
 typedef struct {
@@ -73,12 +81,13 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void C610_SendCurrent(uint8_t id, int16_t current);
 float PID_Calculate(float error);
+
+// 已修复：移除了 get_sin_value 中无用的 float x 参数声明
+float get_sin_value(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#include <stdio.h>
-
 
 /* USER CODE END 0 */
 
@@ -121,7 +130,7 @@ int main(void)
   sFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;    // 掩码模式
   sFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;   // 32位位宽
 
-  // 重点：ID 和 掩码 全部设为 0，代表"不过滤任何报文"，接收总线上的所有数据
+  // ID 和 掩码 全部设为 0，代表"不过滤任何报文"，接收总线上的所有数据
   sFilterConfig.FilterIdHigh = 0x0000;                 // 验证码高位
   sFilterConfig.FilterIdLow = 0x0000;                  // 验证码低位
   sFilterConfig.FilterMaskIdHigh = 0x0000;             // 掩码高位
@@ -158,20 +167,30 @@ int main(void)
   };
   while (1)
   {
+    // 1ms 软件定时器
     if (HAL_GetTick() - last_tick >= 1)
     {
       last_tick = HAL_GetTick();
 
+      // 已修复：在 1ms 周期内实时更新期望目标速度
+      expected_speed = get_sin_value();
+
       float error = expected_speed - motor_speed;
       float pid_out = PID_Calculate(error);
-      float current_cmd_f = pid_out; //* 1000.0f;
-      if (current_cmd_f >  3000) current_cmd_f =  3000;
-      if (current_cmd_f < -3000) current_cmd_f = -3000;
+      float current_cmd_f = pid_out;
+
+      // 电调控制电流限幅（最大限制在 3000）
+      if (current_cmd_f >  3000.0f) current_cmd_f =  3000.0f;
+      if (current_cmd_f < -3000.0f) current_cmd_f = -3000.0f;
       int16_t current_cmd = (int16_t)current_cmd_f;
 
       C610_SendCurrent(4, current_cmd);
 
-      HAL_UART_Transmit_DMA(&huart1, (uint8_t*)&txFrame, sizeof(JustFloatFrame));
+      // 已修复：增加发送前对 UART 状态的校验，防止 1ms 极短时间内把 DMA 挤爆
+      if (huart1.gState == HAL_UART_STATE_READY)
+      {
+        HAL_UART_Transmit_DMA(&huart1, (uint8_t*)&txFrame, sizeof(JustFloatFrame));
+      }
     }
 
     // 处理接收到的反馈（仅在收到新数据时执行）
@@ -180,17 +199,15 @@ int main(void)
       new_data_flag = 0;                      // 清除标志
       HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // LED 闪烁指示接收
 
-      // printf("Angle:%.1f Speed:%.0f Current:%.2fA Error:%d\r\n",
-      //        motor_angle, motor_speed, motor_current, (int)motor_error);
-
-      // 发送给上位机
+      // 填充发送给上位机的数据（第4个通道改成期望速度，方便你在上位机同时观测“目标波形”和“实际波形”）
       txFrame.fdata[0] = motor_angle;
       txFrame.fdata[1] = motor_speed;
       txFrame.fdata[2] = motor_current;
-      txFrame.fdata[3] = motor_error;
+      txFrame.fdata[3] = expected_speed;
     }
 
-    HAL_Delay(1);
+    // 已修复：移除了多余的 HAL_Delay(1);
+    // 依靠 while 极速自旋和 HAL_GetTick() 配合才能保证 1ms 任务的绝对精准，不会有时间累积误差
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -256,31 +273,42 @@ void C610_SendCurrent(uint8_t id, int16_t current)
   int offset = ((id - 1) % 4) * 2;   // 0,2,4,6
   tx_data[offset] = (current >> 8) & 0xFF;
   tx_data[offset + 1] = current & 0xFF;
-  // 其他位置不变（默认为0，表示其他电调电流为0）
-  // 如果控制多个电调，可将它们的电流值填入对应位置
 
   HAL_CAN_AddTxMessage(&hcan, &tx_header, tx_data, &tx_mailbox);
 }
+
 float PID_Calculate(float error) {
   // 比例项
   float P_term = P_gain * error;
 
   // 积分项（采样周期 1ms = 0.001s）
   integral += error * 0.001f;
-  // 积分限幅，防止饱和
 
   float I_term = I_gain * integral;
-
+  // 积分限幅，防止饱和
   if (I_term >  1500.0f) I_term =  1500.0f;
   if (I_term < -1500.0f) I_term = -1500.0f;
 
   // 微分项
-  float derivative = (error - prev_error) / 0.01f;
+  // 已修复：因为 1ms 采样一次，所以 dt 应为 0.001f 而不是之前的 0.01f
+  float derivative = (error - prev_error) / 0.001f;
   float D_term = D_gain * derivative;
   prev_error = error;
 
   return P_term + I_term + D_term;
 }
+
+// 已修复：移除了未使用的 float x 参数声明
+float get_sin_value(void)
+{
+  uint32_t tick = HAL_GetTick();
+  uint32_t phase_ticks = tick % WAVELENGTH;   // WAVELENGTH 为整数（毫秒）
+  float phase = (float)phase_ticks;
+
+  // 使用 sinf 提高单片机浮点运算效率
+  return AMPLITUDE * sinf(2 * 0.00314159265f * phase);
+}
+
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
   if (hcan->Instance == CAN1)
@@ -298,7 +326,7 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
       int16_t actual_current = (rx_data[4] << 8) | rx_data[5];
       uint8_t error_code = rx_data[7];
 
-      motor_speed = (float)speed/36.0f;
+      motor_speed = (float)speed / 36.0f;
       motor_angle = (float)angle / 8191.0f * 360.0f;
       motor_current = (float)actual_current / 1000.0f;
       motor_error = (float)error_code;

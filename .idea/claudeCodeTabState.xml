@@ -7,8 +7,6 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
-              <option name="sessionId" value="e9d7071f-8dc9-428c-b639-669f0ccbee08" />
-              <option name="cwd" value="D:\CubemxProJ\2006" />
               <option name="model" value="claude-fable-5[1m]" />
               <option name="permissionMode" value="plan" />
             </TabSessionState>
