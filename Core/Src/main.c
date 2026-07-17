@@ -56,6 +56,24 @@ volatile uint8_t new_data_flag = 0;
 #define WAVELENGTH 2000
 #define CH_COUNT  4   // 发送的通道数
 
+// ====== 位置环 PID 参数 ======
+static float P_pos   = 0.3f;       // 比例增益
+static float I_pos   = 0.002f;     // 积分增益（小积分消除稳态误差）
+static float D_pos   = 0.0f;       // 微分增益（先置 0，有振荡再打开）
+
+static float pos_integral    = 0.0f;
+static float pos_prev_error  = 0.0f;
+static float pos_max_integral = 100.0f;  // 位置积分限幅（RPM）
+
+volatile float target_angle = 0.0f;      // 目标角度
+
+// ====== UART 命令接收 ======
+#define RX_BUF_SIZE 16
+static uint8_t rx_byte;                  // 单字节接收缓冲
+static char rx_line[RX_BUF_SIZE];        // 行缓冲
+static uint8_t rx_idx = 0;               // 行缓冲位置
+static volatile uint8_t rx_complete = 0; // 行接收完成标志
+
 #pragma pack(push, 1)
 typedef struct {
   float fdata[CH_COUNT];
@@ -84,6 +102,8 @@ float PID_Calculate(float error);
 
 // 已修复：移除了 get_sin_value 中无用的 float x 参数声明
 float get_sin_value(void);
+static float AngleError_ShortestPath(float target, float current);
+static void  PositionController_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -157,6 +177,9 @@ int main(void)
     Error_Handler();
   }
 
+  // 5. 启动 UART 中断接收（单字节模式），用于接收角度指令
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -172,9 +195,30 @@ int main(void)
     {
       last_tick = HAL_GetTick();
 
-      // 已修复：在 1ms 周期内实时更新期望目标速度
-      expected_speed = get_sin_value();
+      // 处理串口接收到的角度指令
+      if (rx_complete)
+      {
+        rx_complete = 0;
+        float new_angle = 0.0f;
+        if (sscanf(rx_line, "%f", &new_angle) == 1)
+        {
+          // 归一化到 [0, 360)
+          new_angle = fmodf(new_angle, 360.0f);
+          if (new_angle < 0) new_angle += 360.0f;
+          target_angle = new_angle;
 
+          // 目标变化时复位 PID 状态，防止积分饱和瞬态
+          pos_integral   = 0.0f;
+          pos_prev_error = 0.0f;
+          integral       = 0.0f;
+          prev_error     = 0.0f;
+        }
+      }
+
+      // 位置环：角度误差 → 速度参考值
+      PositionController_Update();
+
+      // 速度环（复用 PID_Calculate）：速度误差 → 电流指令
       float error = expected_speed - motor_speed;
       float pid_out = PID_Calculate(error);
       float current_cmd_f = pid_out;
@@ -199,11 +243,11 @@ int main(void)
       new_data_flag = 0;                      // 清除标志
       HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // LED 闪烁指示接收
 
-      // 填充发送给上位机的数据（第4个通道改成期望速度，方便你在上位机同时观测“目标波形”和“实际波形”）
+      // 填充发送给上位机的数据（第4个通道改成目标角度，在上位机观察角度跟踪）
       txFrame.fdata[0] = motor_angle;
       txFrame.fdata[1] = motor_speed;
       txFrame.fdata[2] = motor_current;
-      txFrame.fdata[3] = expected_speed;
+      txFrame.fdata[3] = target_angle;
     }
 
     // 已修复：移除了多余的 HAL_Delay(1);
@@ -307,6 +351,69 @@ float get_sin_value(void)
 
   // 使用 sinf 提高单片机浮点运算效率
   return AMPLITUDE * sinf(2 * 0.00314159265f * phase);
+}
+
+/**
+ * 最短路径角度误差，范围 (-180, +180]
+ * 例如：target=10, current=350 → +20（经过 0°，而非 -340°）
+ */
+static float AngleError_ShortestPath(float target, float current)
+{
+  float raw = target - current;
+  return fmodf(raw + 540.0f, 360.0f) - 180.0f;
+}
+
+/**
+ * 位置环控制器，每 1ms 调用一次
+ * 计算角度误差 → 位置 PID → 输出速度参考值到 expected_speed
+ */
+static void PositionController_Update(void)
+{
+  // 最短路径角度误差
+  float angle_err = AngleError_ShortestPath(target_angle, motor_angle);
+
+  // 位置 PID
+  float P_out = P_pos * angle_err;
+
+  pos_integral += angle_err * 0.001f;
+  float I_out = I_pos * pos_integral;
+  // 积分限幅，防止饱和
+  if (I_out >  pos_max_integral) { I_out = pos_max_integral; pos_integral = pos_max_integral / I_pos; }
+  if (I_out < -pos_max_integral) { I_out = -pos_max_integral; pos_integral = -pos_max_integral / I_pos; }
+
+  float derivative = (angle_err - pos_prev_error) / 0.001f;
+  float D_out = D_pos * derivative;
+  pos_prev_error = angle_err;
+
+  float speed_ref = P_out + I_out + D_out;
+
+  // 速度参考限幅 ±200 RPM，防止过冲
+  if (speed_ref >  200.0f) speed_ref =  200.0f;
+  if (speed_ref < -200.0f) speed_ref = -200.0f;
+
+  expected_speed = speed_ref;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    if (rx_byte == '\n' || rx_byte == '\r')
+    {
+      if (rx_idx > 0)
+      {
+        rx_line[rx_idx] = '\0';
+        rx_complete = 1;
+        rx_idx = 0;
+      }
+    }
+    else if (rx_idx < RX_BUF_SIZE - 1)
+    {
+      rx_line[rx_idx++] = rx_byte;
+    }
+    // 重新使能中断接收下一个字节
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  }
 }
 
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
