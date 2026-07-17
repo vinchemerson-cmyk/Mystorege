@@ -45,8 +45,8 @@ volatile float motor_error = 0.0f;
 volatile float expected_speed = 0.0f;
 
 static float P_gain = 300.0f;     // 比例
-static float I_gain = 40.0f;      // 积分
-static float D_gain = 5.0f;      // 微分
+static float I_gain = 150.0f;      // 积分
+static float D_gain = 0.0f;      // 微分
 static float integral = 0.0f;
 static float prev_error = 0.0f;
 volatile uint8_t new_data_flag = 0;
