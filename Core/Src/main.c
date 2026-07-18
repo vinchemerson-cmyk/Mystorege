@@ -31,48 +31,70 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+// 1. 定义标准的 PID 控制器结构体，方便面向对象进行串级管理
+typedef struct {
+  float Kp;             // 比例增益
+  float Ki;             // 积分增益
+  float Kd;             // 微分增益
 
+  float error;          // 当前偏差
+  float last_error;     // 上一次偏差
+  float integral;       // 积分累加值
+
+  float max_integral;   // 积分限幅
+  float max_output;     // 输出限幅
+
+  float out;            // PID 最终输出值
+} PID_Controller;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-volatile float motor_angle = 0.0f;
-volatile float motor_speed = 0.0f;
-volatile float motor_current = 0.0f;
-volatile float motor_error = 0.0f;
+volatile float motor_angle = 0.0f;       // 减速后输出轴的累计绝对物理角度 (度)
+volatile float motor_speed = 0.0f;       // 减速后输出轴的实际转速 (rpm)
+volatile float motor_current = 0.0f;     // 实际反馈转矩电流 (A)[cite: 1]
+volatile float motor_error = 0.0f;       // 电机错误码反馈[cite: 1]
 
-// 已修复：全局变量初始化改为合法的常数 0.0f
-volatile float expected_speed = 0.0f;
+// 多圈角度解算辅助变量
+static int32_t rotor_round = 0;          // 转子累计转过的整圈数
+static uint16_t last_angle = 0;          // 上一次接收到的转子单圈角度
 
-static float P_gain = 300.0f;     // 比例
-static float I_gain = 150.0f;      // 积分
-static float D_gain = 0.0f;      // 微分
-static float integral = 0.0f;
-static float prev_error = 0.0f;
+volatile float expected_position = 0.0f; // 期望目标位置 (度)
+
+// 2. 空载状态下的 PID 参数静态初始化 (针对大疆 M2006 电机优化)
+// 位置外环：纯 P 控制，输入偏差(deg)，输出目标速度(rpm)。Kp=2.2 时 90°偏差 → 198 rpm
+static PID_Controller pos_pid = {
+  .Kp = 20.0f,
+  .Ki = 0.0f,
+  .Kd = 0.0f,
+  .error = 0.0f,
+  .last_error = 0.0f,
+  .integral = 0.0f,
+  .max_integral = 50.0f,// 预留积分限幅，防止误开 Ki 时积分饱和
+  .max_output = 500.0f,// 输出轴最大速度限幅 200 rpm（M2006 空载约 200 rpm）
+  .out = 0.0f
+};
+
+// 速度内环：PI 控制，输入速度偏差(rpm)，输出控制电流 [-10000, 10000]
+// 空载下速度响应极快，Kp 设为 25.0f（防止高频高热和 buzz 震荡声），Ki 设为 0.5f，Kd 设为 0.0f
+static PID_Controller spd_pid = {
+  .Kp = 150.0f,
+  .Ki = 0.5f,
+  .Kd = 0.0f,
+  .error = 0.0f,
+  .last_error = 0.0f,
+  .integral = 0.0f,
+  .max_integral = 1000.0f,// 积分限幅防止积分饱和
+  .max_output = 3000.0f,// 电流最高限幅 3000
+  .out = 0.0f
+};
+
 volatile uint8_t new_data_flag = 0;
 
 #define TWOpai 6.283185307f
-#define AMPLITUDE 200.0f
-#define WAVELENGTH 2000
-#define CH_COUNT  4   // 发送的通道数
-
-// ====== 位置环 PID 参数 ======
-static float P_pos   = 0.3f;       // 比例增益
-static float I_pos   = 0.002f;     // 积分增益（小积分消除稳态误差）
-static float D_pos   = 0.0f;       // 微分增益（先置 0，有振荡再打开）
-
-static float pos_integral    = 0.0f;
-static float pos_prev_error  = 0.0f;
-static float pos_max_integral = 100.0f;  // 位置积分限幅（RPM）
-
-volatile float target_angle = 0.0f;      // 目标角度
-
-// ====== UART 命令接收 ======
-#define RX_BUF_SIZE 16
-static uint8_t rx_byte;                  // 单字节接收缓冲
-static char rx_line[RX_BUF_SIZE];        // 行缓冲
-static uint8_t rx_idx = 0;               // 行缓冲位置
-static volatile uint8_t rx_complete = 0; // 行接收完成标志
+#define AMPLITUDE 360.0f                  // 位置目标幅值：让输出轴在 度 到 度 之间摆动
+#define WAVELENGTH 2000                 // 为使位置追踪平滑，将正弦波周期改为 4000ms
+#define CH_COUNT  4                      // 发送给上位机的通道数
 
 #pragma pack(push, 1)
 typedef struct {
@@ -98,12 +120,8 @@ typedef struct {
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void C610_SendCurrent(uint8_t id, int16_t current);
-float PID_Calculate(float error);
-
-// 已修复：移除了 get_sin_value 中无用的 float x 参数声明
+float PID_Calculate(PID_Controller *pid, float error);
 float get_sin_value(void);
-static float AngleError_ShortestPath(float target, float current);
-static void  PositionController_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -165,20 +183,17 @@ int main(void)
     Error_Handler(); // 配置失败则进入死循环
   }
 
-  // 3. 启动 CAN 外设 (非常重要，否则硬件不会工作)
+  // 3. 启动 CAN 外设
   if (HAL_CAN_Start(&hcan) != HAL_OK)
   {
     Error_Handler();
   }
 
-  // 4. 开启 CAN 接收 FIFO1 挂起中断 (非常重要，否则不会触发回调)
+  // 4. 开启 CAN 接收 FIFO1 挂起中断
   if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO1_MSG_PENDING) != HAL_OK)
   {
     Error_Handler();
   }
-
-  // 5. 启动 UART 中断接收（单字节模式），用于接收角度指令
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
   /* USER CODE END 2 */
 
@@ -190,47 +205,35 @@ int main(void)
   };
   while (1)
   {
-    // 1ms 软件定时器
+    // 1ms 软件定时控制周期
     if (HAL_GetTick() - last_tick >= 1)
     {
       last_tick = HAL_GetTick();
 
-      // 处理串口接收到的角度指令
-      if (rx_complete)
-      {
-        rx_complete = 0;
-        float new_angle = 0.0f;
-        if (sscanf(rx_line, "%f", &new_angle) == 1)
-        {
-          // 归一化到 [0, 360)
-          new_angle = fmodf(new_angle, 360.0f);
-          if (new_angle < 0) new_angle += 360.0f;
-          target_angle = new_angle;
+      // 获取当前 1ms 拍子下正弦波计算出的期望物理位置
+      expected_position = get_sin_value();
 
-          // 目标变化时复位 PID 状态，防止积分饱和瞬态
-          pos_integral   = 0.0f;
-          pos_prev_error = 0.0f;
-          integral       = 0.0f;
-          prev_error     = 0.0f;
-        }
-      }
+      // ================= 串级控制核心计算 =================
 
-      // 位置环：角度误差 → 速度参考值
-      PositionController_Update();
+      // 步骤 1：位置外环计算
+      // 输入：目标角度 - 实际绝对输出轴角度 (motor_angle)
+      // 输出：计算出的目标速度 (target_speed)
+      float pos_error = expected_position - motor_angle;
+      float target_speed = PID_Calculate(&pos_pid, pos_error);
 
-      // 速度环（复用 PID_Calculate）：速度误差 → 电流指令
-      float error = expected_speed - motor_speed;
-      float pid_out = PID_Calculate(error);
-      float current_cmd_f = pid_out;
+      // 步骤 2：速度内环计算
+      // 输入：目标速度 - 实际输出轴转数 (motor_speed)
+      // 输出：期望控制电流指令
+      float spd_error = target_speed - motor_speed;
+      float current_cmd_f = PID_Calculate(&spd_pid, spd_error);
 
-      // 电调控制电流限幅（最大限制在 3000）
-      if (current_cmd_f >  3000.0f) current_cmd_f =  3000.0f;
-      if (current_cmd_f < -3000.0f) current_cmd_f = -3000.0f;
+      // 转换为 int16_t 指令
       int16_t current_cmd = (int16_t)current_cmd_f;
 
+      // 发送电流控制信号给 ID 为 4 的电调[cite: 1]
       C610_SendCurrent(4, current_cmd);
 
-      // 已修复：增加发送前对 UART 状态的校验，防止 1ms 极短时间内把 DMA 挤爆
+      // 增加发送前对 UART 状态的校验，防止 1ms 极短时间内把 DMA 挤爆
       if (huart1.gState == HAL_UART_STATE_READY)
       {
         HAL_UART_Transmit_DMA(&huart1, (uint8_t*)&txFrame, sizeof(JustFloatFrame));
@@ -243,15 +246,13 @@ int main(void)
       new_data_flag = 0;                      // 清除标志
       HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // LED 闪烁指示接收
 
-      // 填充发送给上位机的数据（第4个通道改成目标角度，在上位机观察角度跟踪）
-      txFrame.fdata[0] = motor_angle;
-      txFrame.fdata[1] = motor_speed;
-      txFrame.fdata[2] = motor_current;
-      txFrame.fdata[3] = target_angle;
+      // 填充发送给上位机的数据，以便上位机直观地观测实际位置和目标位置的贴合情况
+      txFrame.fdata[0] = motor_angle;         // 通道 0：输出轴绝对位置 (度)
+      txFrame.fdata[1] = motor_speed;         // 通道 1：输出轴实际转速 (rpm)
+      txFrame.fdata[2] = motor_current;       // 通道 2：实际转矩电流 (A)[cite: 1]
+      txFrame.fdata[3] = expected_position;   // 通道 3：期望目标位置 (度)
     }
 
-    // 已修复：移除了多余的 HAL_Delay(1);
-    // 依靠 while 极速自旋和 HAL_GetTick() 配合才能保证 1ms 任务的绝对精准，不会有时间累积误差
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -299,123 +300,71 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-// 发送控制指令给某个 ID 的电调，电流值范围 -10000 ~ 10000
+// 发送控制指令给某个 ID 的电调，控制电流值范围 -10000 ~ 10000 对应输出 -10A ~ 10A[cite: 1]
 void C610_SendCurrent(uint8_t id, int16_t current)
 {
   CAN_TxHeaderTypeDef tx_header;
   uint8_t tx_data[8] = {0};
   uint32_t tx_mailbox;
 
-  tx_header.StdId = 0x200;   // 选择标识符
+  tx_header.StdId = 0x200;   // 控制 1~4 号电调使用 0x200 标识符[cite: 1]
   tx_header.ExtId = 0;
   tx_header.IDE = CAN_ID_STD;
   tx_header.RTR = CAN_RTR_DATA;
   tx_header.DLC = 8;
   tx_header.TransmitGlobalTime = DISABLE;
 
-  // 根据 ID 在数据域中的位置填充
-  int offset = ((id - 1) % 4) * 2;   // 0,2,4,6
+  // 根据 ID 在数据域中的位置填充[cite: 1]
+  int offset = ((id - 1) % 4) * 2;   // 针对 ID 4，offset 为 6，占用 DATA[6] 和 DATA[7][cite: 1]
   tx_data[offset] = (current >> 8) & 0xFF;
   tx_data[offset + 1] = current & 0xFF;
 
   HAL_CAN_AddTxMessage(&hcan, &tx_header, tx_data, &tx_mailbox);
 }
 
-float PID_Calculate(float error) {
+// 统一的通用 PID 计算函数
+float PID_Calculate(PID_Controller *pid, float error) {
+  pid->error = error;
+
   // 比例项
-  float P_term = P_gain * error;
+  float P_term = pid->Kp * error;
 
-  // 积分项（采样周期 1ms = 0.001s）
-  integral += error * 0.001f;
+  // 积分项（1ms = 0.001s）
+  pid->integral += error * 0.001f;
 
-  float I_term = I_gain * integral;
-  // 积分限幅，防止饱和
-  if (I_term >  1500.0f) I_term =  1500.0f;
-  if (I_term < -1500.0f) I_term = -1500.0f;
+  // 积分项抗饱和限幅
+  if (pid->integral > pid->max_integral)  pid->integral = pid->max_integral;
+  if (pid->integral < -pid->max_integral) pid->integral = -pid->max_integral;
 
-  // 微分项
-  // 已修复：因为 1ms 采样一次，所以 dt 应为 0.001f 而不是之前的 0.01f
-  float derivative = (error - prev_error) / 0.001f;
-  float D_term = D_gain * derivative;
-  prev_error = error;
+  float I_term = pid->Ki * pid->integral;
 
-  return P_term + I_term + D_term;
+  // 微分项（采样周期 1ms）
+  float derivative = (error - pid->last_error) / 0.001f;
+  float D_term = pid->Kd * derivative;
+  pid->last_error = error;
+
+  // 综合计算
+  pid->out = P_term + I_term + D_term;
+
+  // 输出限幅
+  if (pid->out > pid->max_output)  pid->out = pid->max_output;
+  if (pid->out < -pid->max_output) pid->out = -pid->max_output;
+
+  return pid->out;
 }
 
-// 已修复：移除了未使用的 float x 参数声明
+// 获取期望的目标角度，以正弦波形进行平滑变化
 float get_sin_value(void)
 {
   uint32_t tick = HAL_GetTick();
-  uint32_t phase_ticks = tick % WAVELENGTH;   // WAVELENGTH 为整数（毫秒）
+  uint32_t phase_ticks = tick % WAVELENGTH;   // WAVELENGTH 为 4000ms
   float phase = (float)phase_ticks;
 
-  // 使用 sinf 提高单片机浮点运算效率
-  return AMPLITUDE * sinf(2 * 0.00314159265f * phase);
+  // 使用 sinf，幅值为 90.0f，周期 = WAVELENGTH ms
+  return AMPLITUDE * sinf(TWOpai * phase / (float)WAVELENGTH);
 }
 
-/**
- * 最短路径角度误差，范围 (-180, +180]
- * 例如：target=10, current=350 → +20（经过 0°，而非 -340°）
- */
-static float AngleError_ShortestPath(float target, float current)
-{
-  float raw = target - current;
-  return fmodf(raw + 540.0f, 360.0f) - 180.0f;
-}
-
-/**
- * 位置环控制器，每 1ms 调用一次
- * 计算角度误差 → 位置 PID → 输出速度参考值到 expected_speed
- */
-static void PositionController_Update(void)
-{
-  // 最短路径角度误差
-  float angle_err = AngleError_ShortestPath(target_angle, motor_angle);
-
-  // 位置 PID
-  float P_out = P_pos * angle_err;
-
-  pos_integral += angle_err * 0.001f;
-  float I_out = I_pos * pos_integral;
-  // 积分限幅，防止饱和
-  if (I_out >  pos_max_integral) { I_out = pos_max_integral; pos_integral = pos_max_integral / I_pos; }
-  if (I_out < -pos_max_integral) { I_out = -pos_max_integral; pos_integral = -pos_max_integral / I_pos; }
-
-  float derivative = (angle_err - pos_prev_error) / 0.001f;
-  float D_out = D_pos * derivative;
-  pos_prev_error = angle_err;
-
-  float speed_ref = P_out + I_out + D_out;
-
-  // 速度参考限幅 ±200 RPM，防止过冲
-  if (speed_ref >  200.0f) speed_ref =  200.0f;
-  if (speed_ref < -200.0f) speed_ref = -200.0f;
-
-  expected_speed = speed_ref;
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    if (rx_byte == '\n' || rx_byte == '\r')
-    {
-      if (rx_idx > 0)
-      {
-        rx_line[rx_idx] = '\0';
-        rx_complete = 1;
-        rx_idx = 0;
-      }
-    }
-    else if (rx_idx < RX_BUF_SIZE - 1)
-    {
-      rx_line[rx_idx++] = rx_byte;
-    }
-    // 重新使能中断接收下一个字节
-    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
-  }
-}
-
+// CAN1 接收中断回调函数
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
   if (hcan->Instance == CAN1)
@@ -425,20 +374,48 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
     HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header, rx_data);
 
     uint16_t std_id = rx_header.StdId;
-    if (std_id >= 0x201 && std_id <= 0x208)
+    if (std_id >= 0x201 && std_id <= 0x208) // 接收电调反馈[cite: 1]
     {
       // 解析数据
-      uint16_t angle = (rx_data[0] << 8) | rx_data[1];
-      int16_t speed = (rx_data[2] << 8) | rx_data[3];
-      int16_t actual_current = (rx_data[4] << 8) | rx_data[5];
-      uint8_t error_code = rx_data[7];
+      uint16_t angle = (rx_data[0] << 8) | rx_data[1];      // 单圈转子机械角度 0~8191[cite: 1]
+      int16_t speed = (rx_data[2] << 8) | rx_data[3];       // 转子转速 rpm[cite: 1]
+      int16_t actual_current = (rx_data[4] << 8) | rx_data[5]; // 实际转矩电流[cite: 1]
+      uint8_t error_code = rx_data[7];                      // 电机错误码反馈[cite: 1]
 
-      motor_speed = (float)speed / 36.0f;
-      motor_angle = (float)angle / 8191.0f * 360.0f;
-      motor_current = (float)actual_current / 1000.0f;
+      // 多圈过零检测解算：首次运行初始化，防止启动时跳变
+      static uint8_t is_first_run = 1;
+      if (is_first_run)
+      {
+        last_angle = angle;
+        is_first_run = 0;
+      }
+
+      int16_t diff = angle - last_angle;
+      if (diff < -4096)
+      {
+        rotor_round++; // 正向越过零点，累计圈数 +1
+      }
+      else if (diff > 4096)
+      {
+        rotor_round--; // 反向越过零点，累计圈数 -1
+      }
+      last_angle = angle;
+
+      // 1. 转子单圈物理角度
+      float rotor_single_angle = (float)angle / 8191.0f * 360.0f;
+      // 2. 转子绝对多圈累计角度
+      float total_rotor_angle = (float)rotor_round * 360.0f + rotor_single_angle;
+
+      // 3. 计算 M2006 减速后输出轴的绝对角度（减速比 36:1）
+      float output_shaft_angle = total_rotor_angle / 36.0f;
+
+      // 物理量反馈写入全局变量
+      motor_angle = output_shaft_angle;                     // 输出轴绝对物理角度 (度)
+      motor_speed = (float)speed / 36.0f;                   // 输出轴实际速度 (rpm)
+      motor_current = (float)actual_current / 1000.0f;      // 实际电流 (A)
       motor_error = (float)error_code;
 
-      new_data_flag = 1; // 标记有新数据，通知主循环
+      new_data_flag = 1; // 标记接收到最新反馈，通知主循环
     }
   }
 }
