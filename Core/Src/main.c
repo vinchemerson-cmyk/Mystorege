@@ -23,7 +23,6 @@
 #include "usart.h"
 #include "gpio.h"
 #include "math.h"
-#include "fastmath.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
@@ -52,8 +51,8 @@ typedef struct {
 /* USER CODE BEGIN PD */
 volatile float motor_angle = 0.0f;       // 减速后输出轴的累计绝对物理角度 (度)
 volatile float motor_speed = 0.0f;       // 减速后输出轴的实际转速 (rpm)
-volatile float motor_current = 0.0f;     // 实际反馈转矩电流 (A)[cite: 1]
-volatile float motor_error = 0.0f;       // 电机错误码反馈[cite: 1]
+volatile float motor_current = 0.0f;     // 实际反馈转矩电流
+volatile float motor_error = 0.0f;       // 电机错误码反馈
 
 // 多圈角度解算辅助变量
 static int32_t rotor_round = 0;          // 转子累计转过的整圈数
@@ -61,22 +60,21 @@ static uint16_t last_angle = 0;          // 上一次接收到的转子单圈角
 
 volatile float expected_position = 0.0f; // 期望目标位置 (度)
 
-// 2. 空载状态下的 PID 参数静态初始化 (针对大疆 M2006 电机优化)
+// 2. 空载状态下的 PID 参数静态初始化
 // 位置外环：纯 P 控制，输入偏差(deg)，输出目标速度(rpm)。Kp=2.2 时 90°偏差 → 198 rpm
 static PID_Controller pos_pid = {
-  .Kp = 20.0f,
+  .Kp = 2.7f,
   .Ki = 0.0f,
   .Kd = 0.0f,
   .error = 0.0f,
   .last_error = 0.0f,
   .integral = 0.0f,
   .max_integral = 50.0f,// 预留积分限幅，防止误开 Ki 时积分饱和
-  .max_output = 500.0f,// 输出轴最大速度限幅 200 rpm（M2006 空载约 200 rpm）
+  .max_output = 1000.0f,// 输出轴最大速度限幅 1000 rpm（M2006 空载约 200 rpm）
   .out = 0.0f
 };
 
 // 速度内环：PI 控制，输入速度偏差(rpm)，输出控制电流 [-10000, 10000]
-// 空载下速度响应极快，Kp 设为 25.0f（防止高频高热和 buzz 震荡声），Ki 设为 0.5f，Kd 设为 0.0f
 static PID_Controller spd_pid = {
   .Kp = 150.0f,
   .Ki = 0.5f,
@@ -85,16 +83,17 @@ static PID_Controller spd_pid = {
   .last_error = 0.0f,
   .integral = 0.0f,
   .max_integral = 1000.0f,// 积分限幅防止积分饱和
-  .max_output = 3000.0f,// 电流最高限幅 3000
+  .max_output = 6000.0f,// 电流最高限幅 5000
   .out = 0.0f
 };
 
 volatile uint8_t new_data_flag = 0;
 
-#define TWOpai 6.283185307f
+#define TWO_PI 6.283185307f
 #define AMPLITUDE 360.0f                  // 位置目标幅值：让输出轴在 度 到 度 之间摆动
-#define WAVELENGTH 2000                 // 为使位置追踪平滑，将正弦波周期改为 4000ms
+#define BASE_PERIOD_MS  2000
 #define CH_COUNT  4                      // 发送给上位机的通道数
+#define WAVE_NORM       (1.0f / 2.65f)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -121,7 +120,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void C610_SendCurrent(uint8_t id, int16_t current);
 float PID_Calculate(PID_Controller *pid, float error);
-float get_sin_value(void);
+float get_chaotic_periodic(uint32_t tick_ms, float max_offset);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -211,7 +210,7 @@ int main(void)
       last_tick = HAL_GetTick();
 
       // 获取当前 1ms 拍子下正弦波计算出的期望物理位置
-      expected_position = get_sin_value();
+      expected_position = 720;    //get_chaotic_periodic(HAL_GetTick(), AMPLITUDE);
 
       // ================= 串级控制核心计算 =================
 
@@ -249,7 +248,7 @@ int main(void)
       // 填充发送给上位机的数据，以便上位机直观地观测实际位置和目标位置的贴合情况
       txFrame.fdata[0] = motor_angle;         // 通道 0：输出轴绝对位置 (度)
       txFrame.fdata[1] = motor_speed;         // 通道 1：输出轴实际转速 (rpm)
-      txFrame.fdata[2] = motor_current;       // 通道 2：实际转矩电流 (A)[cite: 1]
+      txFrame.fdata[2] = motor_current;       // 通道 2：实际转矩电流 (A)
       txFrame.fdata[3] = expected_position;   // 通道 3：期望目标位置 (度)
     }
 
@@ -354,16 +353,35 @@ float PID_Calculate(PID_Controller *pid, float error) {
 }
 
 // 获取期望的目标角度，以正弦波形进行平滑变化
-float get_sin_value(void)
+// float get_chaotic_periodic(uint32_t tick_ms, float max_offset)
+// {
+//   // 1. 计算当前周期内的相位（0~1 之间）
+//   float phase = (float)(tick_ms % BASE_PERIOD_MS) / BASE_PERIOD_MS;
+//   float rad = phase * TWO_PI;
+//
+//   // 2. 叠加多个不同频率、不同幅值、不同相位偏移的正弦波
+//   //    刻意使用非对称的相位偏移 (1.2, 2.7, 0.8, 1.5)，让波形看起来毫无规律
+//   float wave = 1.0f * sinf(rad)
+//              + 0.8f * sinf(2.0f * rad + 1.2f)
+//              + 0.5f * sinf(3.0f * rad + 2.7f)
+//              + 0.5f * sinf(5.0f * rad + 0.8f)
+//              + 0.3f * sinf(7.0f * rad + 1.5f)
+//              + 0.2f * sinf(11.0f * rad + 0.3f)   // 新增11次谐波
+//              + 0.15f * sinf(13.0f * rad + 2.1f); // 新增13次谐波
+//   // 总系数 = 1.0+0.8+0.5+0.5+0.3+0.2+0.15 = 3.45
+// #define WAVE_NORM  (1.0f / 3.45f)
+//   // 3. 归一化并乘以用户设定的最大偏移量
+//   return max_offset * WAVE_NORM * wave;
+// }
+// 临时替换 get_chaotic_periodic 为阶跃函数
+float get_chaotic_periodic(uint32_t tick_ms, float max_offset)
 {
-  uint32_t tick = HAL_GetTick();
-  uint32_t phase_ticks = tick % WAVELENGTH;   // WAVELENGTH 为 4000ms
-  float phase = (float)phase_ticks;
-
-  // 使用 sinf，幅值为 90.0f，周期 = WAVELENGTH ms
-  return AMPLITUDE * sinf(TWOpai * phase / (float)WAVELENGTH);
+  // 每 2 秒切换一次目标值
+  if ((tick_ms / 2000) % 2 == 0)
+    return max_offset * 0.5f;   // 例如 180°
+  else
+    return -max_offset * 0.5f;  // -180°
 }
-
 // CAN1 接收中断回调函数
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
