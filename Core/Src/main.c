@@ -96,8 +96,12 @@ int main(void)
     Error_Handler();
   }
 
-  /* Change this value to the desired GM6020 speed, in rpm. */
-  GM6020_SetTargetSpeed(100.0f);
+  /*
+   * Select one:
+   *   GM6020_CONTROL_SPEED    - speed PID only
+   *   GM6020_CONTROL_POSITION - angle PID + speed PID
+   */
+  GM6020_SetControlMode(GM6020_CONTROL_POSITION);
   /* USER CODE END 2 */
 
   /* Infinite loop */
