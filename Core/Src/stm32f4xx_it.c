@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -199,5 +200,13 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief 处理 USART6 接收中断。
+  */
+void USART6_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart6);
+}
 
 /* USER CODE END 1 */

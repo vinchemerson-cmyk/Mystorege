@@ -1,0 +1,302 @@
+<mxfile host="Electron" agent="Codex">
+  <diagram id="gm6020-architecture" name="当前项目代码架构">
+    <mxGraphModel dx="1705" dy="1493" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontSize=24;fontStyle=1;fontColor=#1F2937;" value="STM32F407 + GM6020 当前项目代码架构与控制数据流" vertex="1">
+          <mxGeometry height="50" width="1540" x="30" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="appBg" parent="1" style="swimlane;html=1;rounded=1;startSize=30;horizontal=1;fillColor=#EAF2FF;strokeColor=#6C8EBF;fontStyle=1;fontSize=15;collapsible=0;" value="应用层 / 主程序" vertex="1">
+          <mxGeometry height="130" width="1540" x="30" y="90" as="geometry" />
+        </mxCell>
+        <mxCell id="controlBg" parent="1" style="swimlane;html=1;rounded=1;startSize=30;horizontal=1;fillColor=#EAF7EA;strokeColor=#82B366;fontStyle=1;fontSize=15;collapsible=0;" value="电机控制层：Core/Src/motor_control.c" vertex="1">
+          <mxGeometry height="420" width="1540" x="30" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="driverBg" parent="1" style="swimlane;html=1;rounded=1;startSize=30;horizontal=1;fillColor=#FFF4E6;strokeColor=#D79B00;fontStyle=1;fontSize=15;collapsible=0;" value="STM32Cube HAL / 板级驱动" vertex="1">
+          <mxGeometry height="180" width="900" x="30" y="690" as="geometry" />
+        </mxCell>
+        <mxCell id="externalBg" parent="1" style="swimlane;html=1;rounded=1;startSize=30;horizontal=1;fillColor=#F4ECFF;strokeColor=#9673A6;fontStyle=1;fontSize=15;collapsible=0;" value="外部设备" vertex="1">
+          <mxGeometry height="180" width="610" x="960" y="690" as="geometry" />
+        </mxCell>
+        <mxCell id="mainInit" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" value="main.c：系统初始化&#xa;HAL / 时钟 / GPIO&#xa;CAN1 / USART6 / GM6020_Init" vertex="1">
+          <mxGeometry height="70" width="270" x="70" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="mainLoop" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;fontStyle=1;" value="main.c：while(1)&#xa;GM6020_Process()" vertex="1">
+          <mxGeometry height="55" width="220" x="390" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="modeApi" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" value="模式接口&#xa;GM6020_SetControlMode()&#xa;速度环 / 位置速度串级环" vertex="1">
+          <mxGeometry height="70" width="270" x="680" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="safetySummary" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=13;" value="安全策略&#xa;电流限幅 ±8192&#xa;反馈超时 100 ms → 零电流" vertex="1">
+          <mxGeometry height="70" width="270" x="1050" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="trajectory" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=13;" value="正弦轨迹生成&#xa;速度：±100 rpm / 4 s&#xa;角度：0~90° / 4 s" vertex="1">
+          <mxGeometry height="80" width="230" x="70" y="290" as="geometry" />
+        </mxCell>
+        <mxCell id="modeSelect" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;fontStyle=1;" value="当前模式？" vertex="1">
+          <mxGeometry height="70" width="130" x="350" y="295" as="geometry" />
+        </mxCell>
+        <mxCell id="angleTarget" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" value="单圈目标角度&#xa;归一化到 0~360°" vertex="1">
+          <mxGeometry height="60" width="190" x="550" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="speedTarget" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" value="目标速度 rpm&#xa;单速度环直接输入" vertex="1">
+          <mxGeometry height="60" width="190" x="550" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="arcResolver" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=13;" value="优劣弧 + 多圈目标解析&#xa;劣弧：最短路径&#xa;优弧：长路径" vertex="1">
+          <mxGeometry height="80" width="220" x="800" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="anglePid" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;fontStyle=1;" value="角度 PID 外环&#xa;多圈角度误差 → 目标速度&#xa;输出限幅 ±100 rpm" vertex="1">
+          <mxGeometry height="80" width="220" x="1080" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="speedPid" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;fontStyle=1;" value="速度 PID 内环&#xa;速度误差 → 转矩电流指令&#xa;条件积分抗饱和" vertex="1">
+          <mxGeometry height="85" width="210" x="1320" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="currentLimit" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=13;" value="电流限幅与 CAN 打包&#xa;ID 1 → DATA[0:1]&#xa;0x1FE 标准数据帧" vertex="1">
+          <mxGeometry height="80" width="230" x="1300" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="canParse" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" value="CAN 反馈解析&#xa;0x205 / DLC=8&#xa;角度、速度、电流、温度" vertex="1">
+          <mxGeometry height="80" width="210" x="70" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="unwrap" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=13;" value="编码器多圈检测&#xa;0/8191 跨零判断&#xa;累计 turn_count" vertex="1">
+          <mxGeometry height="80" width="210" x="340" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="feedbackState" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" value="GM6020_Feedback_t&#xa;多圈角度 / rpm / 电流&#xa;温度 / 在线时间戳" vertex="1">
+          <mxGeometry height="80" width="220" x="610" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="csv" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" value="CSV 遥测（50 Hz）&#xa;目标/实际角度、速度&#xa;目标/实际电流" vertex="1">
+          <mxGeometry height="80" width="210" x="890" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="timeout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=13;" value="在线与掉线保护&#xa;now-last_rx &gt; 100 ms&#xa;复位 PID / 输出零电流" vertex="1">
+          <mxGeometry height="70" width="150" x="1130" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="canDriver" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;fontStyle=1;" value="can.c / HAL CAN1&#xa;1 Mbps，PD0/PD1&#xa;RX FIFO0 / TX Mailbox" vertex="1">
+          <mxGeometry height="85" width="240" x="90" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="uartDriver" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;fontStyle=1;" value="usart.c / HAL USART6&#xa;115200-8-N-1，PG14/PG9&#xa;文本 CSV 输出" vertex="1">
+          <mxGeometry height="85" width="240" x="380" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="halTick" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;" value="HAL_GetTick()&#xa;轨迹相位 / 超时判断&#xa;串口发送周期" vertex="1">
+          <mxGeometry height="85" width="210" x="670" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="motor" parent="1" style="shape=mxgraph.electrical.miscellaneous.motor;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=13;fontStyle=1;" value="GM6020（ID=1）&#xa;内部电流环已开启&#xa;反馈频率 1 kHz" vertex="1">
+          <mxGeometry height="85" width="220" x="1020" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="serialHost" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=13;fontStyle=1;" value="串口调试/绘图软件&#xa;关闭“接收 HEX”&#xa;按逗号解析 6 路数据" vertex="1">
+          <mxGeometry height="85" width="220" x="1300" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="legend" parent="1" style="text;html=1;whiteSpace=wrap;fontSize=12;fontColor=#4B5563;" value="控制主链路&#xa;反馈链路&#xa;初始化/时序/保护" vertex="1">
+          <mxGeometry height="70" width="180" x="80" y="900" as="geometry" />
+        </mxCell>
+        <mxCell id="legend1" edge="1" parent="1" style="endArrow=block;html=1;strokeColor=#2E7D32;strokeWidth=2;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="270" y="915" as="sourcePoint" />
+            <mxPoint x="350" y="915" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="legend2" edge="1" parent="1" style="endArrow=block;html=1;strokeColor=#1565C0;strokeWidth=2;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="270" y="935" as="sourcePoint" />
+            <mxPoint x="350" y="935" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="legend3" edge="1" parent="1" style="endArrow=block;html=1;strokeColor=#B85450;strokeWidth=2;dashed=1;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="270" y="955" as="sourcePoint" />
+            <mxPoint x="350" y="955" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eMainProcess" edge="1" parent="1" source="mainLoop" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="trajectory" value="高频轮询">
+          <mxGeometry relative="1" x="0.0383" y="32" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="500" y="227" />
+              <mxPoint x="185" y="227" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eModeApi" edge="1" parent="1" source="modeApi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="modeSelect" value="设置 control_mode">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="815" y="241" />
+              <mxPoint x="415" y="241" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eTrajectoryMode" edge="1" parent="1" source="trajectory" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="modeSelect" value="目标生成">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eModeAngle" edge="1" parent="1" source="modeSelect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="angleTarget" value="位置模式">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="515" y="330" />
+              <mxPoint x="515" y="300" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eModeSpeed" edge="1" parent="1" source="modeSelect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="speedTarget" value="速度模式">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="415" y="390" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eAngleArc" edge="1" parent="1" source="angleTarget" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="arcResolver" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eArcAnglePid" edge="1" parent="1" source="arcResolver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="anglePid" value="多圈目标">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eAngleSpeedPid" edge="1" parent="1" source="anglePid" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="speedPid" value="目标速度">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1425" y="300" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eSpeedTargetPid" edge="1" parent="1" source="speedTarget" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="speedPid" value="目标速度">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1030" y="390" />
+              <mxPoint x="1030" y="393" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eSpeedCurrent" edge="1" parent="1" source="speedPid" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="currentLimit" value="电流原始值">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1425" y="479" />
+              <mxPoint x="1415" y="479" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eCanParseUnwrap" edge="1" parent="1" source="canParse" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="unwrap" value="机械角度">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eUnwrapFeedback" edge="1" parent="1" source="unwrap" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="feedbackState" value="多圈角度">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eFeedbackAngle" edge="1" parent="1" source="feedbackState" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="anglePid" value="实际角度">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="720" y="451" />
+              <mxPoint x="1190" y="451" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eFeedbackSpeed" edge="1" parent="1" source="feedbackState" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="speedPid" value="实际速度">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="720" y="465" />
+              <mxPoint x="1425" y="465" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eFeedbackCsv" edge="1" parent="1" source="feedbackState" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="csv" value="遥测数据">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eFeedbackTimeout" edge="1" parent="1" source="feedbackState" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="timeout" value="时间戳">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="720" y="606" />
+              <mxPoint x="1205" y="606" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eTimeoutCurrent" edge="1" parent="1" source="timeout" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;strokeWidth=2;dashed=1;curved=0;" target="currentLimit" value="掉线：0 电流">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1290" y="555" />
+              <mxPoint x="1290" y="540" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eInitCan" edge="1" parent="1" source="mainInit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="canDriver" value="MX_CAN1_Init()">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="205" y="255" />
+              <mxPoint x="316" y="255" />
+              <mxPoint x="316" y="654" />
+              <mxPoint x="210" y="654" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eInitUart" edge="1" parent="1" source="mainInit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="uartDriver" value="MX_USART6_UART_Init()">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="205" y="241" />
+              <mxPoint x="322" y="241" />
+              <mxPoint x="322" y="640" />
+              <mxPoint x="500" y="640" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eCurrentCan" edge="1" parent="1" source="currentLimit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="canDriver" value="HAL_CAN_AddTxMessage">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1415" y="668" />
+              <mxPoint x="210" y="668" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eCanMotor" edge="1" parent="1" source="canDriver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="motor" value="0x1FE 电流指令">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="210" y="724" />
+              <mxPoint x="1130" y="724" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eMotorCan" edge="1" parent="1" source="motor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="canDriver" value="0x205 反馈 / 1 kHz">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1130" y="710" />
+              <mxPoint x="210" y="710" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eCanParse" edge="1" parent="1" source="canDriver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#1565C0;strokeWidth=2;curved=0;" target="canParse" value="HAL_CAN_GetRxMessage">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="210" y="660" />
+              <mxPoint x="175" y="660" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eCsvUart" edge="1" parent="1" source="csv" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="uartDriver" value="HAL_UART_Transmit">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="995" y="682" />
+              <mxPoint x="500" y="682" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eUartHost" edge="1" parent="1" source="uartDriver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#2E7D32;strokeWidth=2;curved=0;" target="serialHost" value="CSV 文本">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="500" y="696" />
+              <mxPoint x="1410" y="696" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eTickTrajectory" edge="1" parent="1" source="halTick" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="trajectory" value="HAL_GetTick">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="775" y="654" />
+              <mxPoint x="319" y="654" />
+              <mxPoint x="319" y="330" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eTickTimeout" edge="1" parent="1" source="halTick" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#B85450;dashed=1;curved=0;" target="timeout" value="周期/超时">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="775" y="654" />
+              <mxPoint x="1205" y="654" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

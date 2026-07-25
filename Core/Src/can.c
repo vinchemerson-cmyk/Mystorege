@@ -35,7 +35,10 @@ void MX_CAN1_Init(void)
   /* USER CODE END CAN1_Init 0 */
 
   /* USER CODE BEGIN CAN1_Init 1 */
-
+  /*
+   * APB1 CAN 时钟为 42 MHz：
+   * 42 MHz / Prescaler 2 / (1 + BS1 16 + BS2 4) = 1 Mbps。
+   */
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 2;

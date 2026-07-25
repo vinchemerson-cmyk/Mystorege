@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "motor_control.h"
+#include "mouse_position_rx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -91,17 +92,16 @@ int main(void)
   MX_CAN1_Init();
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
-  if (GM6020_Init(&hcan1, &huart6) != HAL_OK)
+  if (GM6020_Init(&hcan1) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /*
-   * Select one:
-   *   GM6020_CONTROL_SPEED    - speed PID only
-   *   GM6020_CONTROL_POSITION - angle PID + speed PID
-   */
-  GM6020_SetControlMode(GM6020_CONTROL_POSITION);
+  /* 启动 USART6 逐字节中断接收鼠标位置帧。 */
+  if (MousePositionRx_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -111,6 +111,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 先应用最新鼠标目标，再运行位置/速度串级 PID。 */
+    MousePositionRx_Process();
     GM6020_Process();
   }
   /* USER CODE END 3 */
