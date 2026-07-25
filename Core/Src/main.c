@@ -24,6 +24,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+/*
+ * 项目自定义模块：
+ *   motor_control.h   — 双轴 GM6020 电机串级 PID 控制
+ *   mouse_position_rx.h — 串口鼠标位置帧接收与解析
+ */
 #include "motor_control.h"
 #include "mouse_position_rx.h"
 /* USER CODE END Includes */
@@ -35,6 +40,28 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/*
+ * 速度环调试上电自启动配置。
+ *
+ * SPEED_LOOP_DEBUG_BOOT_ENABLE:
+ *   0 — 正常模式：上电后进入位置控制（等待鼠标/串口目标角度）
+ *   1 — 调试模式：上电收到 CAN 反馈后自动进入速度环调试，
+ *       绕过角度环，以固定 RPM 驱动电机。
+ *
+ * 仅在需要整定速度环 PID 参数或测试电机机械响应时开启。
+ * 正常使用时设为 0。
+ *
+ * SPEED_LOOP_DEBUG_AXIS:
+ *   调试目标轴：GM6020_AXIS_YAW 或 GM6020_AXIS_PITCH
+ *
+ * SPEED_LOOP_DEBUG_TARGET_RPM:
+ *   调试模式下的初始目标转速（rpm），自动限幅到 ±200 RPM。
+ *   正负方向由电机安装方向及编码器标定决定。
+ */
+#define SPEED_LOOP_DEBUG_BOOT_ENABLE  0U
+#define SPEED_LOOP_DEBUG_AXIS         GM6020_AXIS_YAW
+#define SPEED_LOOP_DEBUG_TARGET_RPM   100.0f
 
 /* USER CODE END PD */
 
@@ -92,16 +119,42 @@ int main(void)
   MX_CAN1_Init();
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  /*
+   * 初始化双轴 GM6020 电机控制器。
+   * 内部流程：校验配置 → 配置 CAN 滤波器（0x205, 0x206）
+   *         → 启动 CAN → 发送初始零电流命令。
+   * 必须在 MX_CAN1_Init() 之后调用。
+   */
   if (GM6020_Init(&hcan1) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /* 启动 USART6 逐字节中断接收鼠标位置帧。 */
+  /*
+   * 初始化串口鼠标位置接收器。
+   * 启动 USART6 单字节中断接收，解析 PC 端发送的 8 字节角度帧。
+   * 必须在 MX_USART6_UART_Init() 之后调用。
+   */
   if (MousePositionRx_Init(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
+
+#if SPEED_LOOP_DEBUG_BOOT_ENABLE
+  /*
+   * 上电自动进入速度环调试模式：
+   *   1. 覆盖默认的 PID 增益（便于快速迭代调参）
+   *   2. 进入速度调试模式，以固定 RPM 驱动指定轴
+   *
+   * 调试期间鼠标位置帧仍会被接收和缓存，但不会干扰速度环。
+   * 调参完成后将 SPEED_LOOP_DEBUG_BOOT_ENABLE 改回 0 即可。
+   */
+  (void)GM6020_SetSpeedPidGains(
+      SPEED_LOOP_DEBUG_AXIS, 31.0f, 30.0f, 0.0f);
+  GM6020_EnterSpeedDebug(
+      SPEED_LOOP_DEBUG_AXIS, SPEED_LOOP_DEBUG_TARGET_RPM);
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -111,7 +164,23 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 先应用最新鼠标目标，再运行位置/速度串级 PID。 */
+
+    /*
+     * 主循环调度（裸机，无 RTOS）：
+     *
+     *   1. MousePositionRx_Process()
+     *      检查是否有来自 USART6 中断的新鼠标位置命令，
+     *      如果有则更新 Yaw 轴位置目标。
+     *
+     *   2. GM6020_Process()
+     *      接收两轴 CAN 反馈 → 更新编码器 → 状态机 → PID 计算
+     *      → 发送合并 0x1FE 电流命令。
+     *
+     * 执行顺序说明：
+     *   先 MousePositionRx、后 GM6020 确保：
+     *   当前轮次收到的位置目标在同一轮次的 PID 计算中生效。
+     *   如果顺序颠倒，新的位置目标会延迟到下一个控制周期才生效。
+     */
     MousePositionRx_Process();
     GM6020_Process();
   }
