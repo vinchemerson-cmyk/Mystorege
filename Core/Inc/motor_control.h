@@ -1,3 +1,44 @@
+/**
+ * ===========================================================================
+ * @file    motor_control.h
+ * @brief   双轴 GM6020 云台电机控制模块 — 对外 API 声明、类型定义与数据接口
+ * ===========================================================================
+ *
+ * 【模块职责】
+ *   管理两个 DJI GM6020 无刷直流电机的完整伺服控制：
+ *     - CAN 反馈接收（编码器角度、转速、转矩电流、温度）
+ *     - 多圈编码器累计追踪（跨零点检测）
+ *     - 串级 PID 控制（外环角度环 → 内环速度环 → 转矩电流输出）
+ *     - 锁存式急停保护
+ *     - 速度环调试模式
+ *
+ * 【数据类型】
+ *   GM6020_Axis_t          轴枚举 (Yaw=0, Pitch=1)
+ *   GM6020_ControlMode_t   控制模式 (位置控制 / 速度调试)
+ *   GM6020_Feedback_t      完整反馈数据（角度/转速/电流/温度/在线状态）
+ *   GM6020_SpeedDebugData_t 速度环调试数据（用于上位机绘图）
+ *
+ * 【对外 API 分组】
+ *   初始化:    GM6020_Init()
+ *   位置控制:  GM6020_SetTargetPosition(), GM6020_SetMultiTurnTargetPosition(),
+ *              GM6020_SetGimbalPosition()
+ *   速度调试:  GM6020_EnterSpeedDebug(), GM6020_SetSpeedDebugTarget(),
+ *              GM6020_ExitSpeedDebug()
+ *   PID 调参:  GM6020_SetSpeedPidGains(), GM6020_SetAnglePidGains()
+ *   安全:      GM6020_EmergencyStop(), GM6020_ClearEmergencyStop(),
+ *              GM6020_IsEmergencyStopped()
+ *   查询:      GM6020_GetFeedback(), GM6020_GetMultiTurnPosition(),
+ *              GM6020_GetControlMode(), GM6020_GetSpeedDebugData()
+ *   主循环:    GM6020_Process()
+ *
+ * 【依赖】
+ *   config/gimbal_params.h  CAN ID、PID 增益、零位偏置、软限位
+ *   CAN1 硬件 (PD0/PD1)     电机反馈总线
+ *
+ * 【控制架构】参见 motor_control.c 文件头注释。
+ * ===========================================================================
+ */
+
 #ifndef __MOTOR_CONTROL_H__
 #define __MOTOR_CONTROL_H__
 
@@ -10,11 +51,11 @@ extern "C" {
 #include <stdint.h>
 
 /*
- * 轴枚举。
+ * 轴枚举 (Axis Enumeration)。
  *
  * 默认电机 ID 映射：
- *   Yaw   (偏航) → GM6020 ID 1，CAN 反馈帧 StdId = 0x205
- *   Pitch (俯仰) → GM6020 ID 2，CAN 反馈帧 StdId = 0x206
+ *   Yaw   (偏航 / Yaw axis)    → GM6020 ID 1，CAN 反馈帧 StdId = 0x205
+ *   Pitch (俯仰 / Pitch axis)  → GM6020 ID 2，CAN 反馈帧 StdId = 0x206
  *
  * GM6020_AXIS_COUNT 用于数组大小声明和循环边界。
  */
@@ -30,8 +71,8 @@ typedef enum
  */
 typedef enum
 {
-  GM6020_MODE_POSITION = 0, /* 角度环 + 速度环串级位置控制 */
-  GM6020_MODE_SPEED_DEBUG   /* 绕过角度环，目标 RPM 直接进入速度环 */
+  GM6020_MODE_POSITION = 0, /* 位置控制模式 — Position Control: 角度环 + 速度环串级 */
+  GM6020_MODE_SPEED_DEBUG   /* 速度调试模式 — Speed Debug: 绕过角度环，目标RPM直接进速度环 */
 } GM6020_ControlMode_t;
 
 /*
@@ -44,15 +85,15 @@ typedef enum
  */
 typedef struct
 {
-  uint16_t angle;           /* 单圈机械角度原始值，范围 0~8191 (8192 CPR) */
-  int32_t turn_count;       /* 累计圈数：正向跨零 +1，反向跨零 -1，上电从 0 开始 */
-  int32_t total_angle_ecd;  /* 多圈累计角度，单位：编码器计数 (counts) */
-  float total_angle_deg;    /* 多圈累计角度，单位：度 (degrees) */
-  int16_t speed_rpm;        /* 电机反馈转速，单位：rpm；正方向由安装和标定定义 */
-  int16_t torque_current;   /* 转矩电流原始值，±16384 对应约 ±3 A（GM6020 手册） */
-  uint8_t temperature;      /* 电机内部温度传感器读数，单位：摄氏度 (℃) */
-  uint32_t last_rx_ms;      /* 最近一次收到有效 CAN 反馈时的 HAL_GetTick() 值 */
-  bool online;              /* true：反馈时间未超过配置的离线超时阈值 */
+  uint16_t angle;           /* 单圈机械角度原始值 — raw single-turn mechanical angle (0~8191, 8192 CPR) */
+  int32_t turn_count;       /* 累计圈数 — accumulated turn count: 正向跨零+1, 反向跨零-1, starts at 0 */
+  int32_t total_angle_ecd;  /* 多圈累计角度 — multi-turn total angle in encoder counts */
+  float total_angle_deg;    /* 多圈累计角度 — multi-turn total angle in degrees */
+  int16_t speed_rpm;        /* 电机反馈转速 — feedback speed (rpm), 正方向由安装和标定定义 */
+  int16_t torque_current;   /* 转矩电流原始值 — torque current raw value (±16384 ≈ ±3A per GM6020 datasheet) */
+  uint8_t temperature;      /* 电机内部温度 — internal temperature sensor reading (℃) */
+  uint32_t last_rx_ms;      /* 最近有效反馈时间戳 — last valid CAN feedback timestamp (HAL_GetTick) */
+  bool online;              /* 在线状态 — true: 距上次反馈未超过超时阈值 */
 } GM6020_Feedback_t;
 
 /*
@@ -63,14 +104,14 @@ typedef struct
  */
 typedef struct
 {
-  float target_speed_rpm;     /* 速度环目标转速 (rpm) */
-  float feedback_speed_rpm;   /* 电机反馈转速 (rpm) */
-  float speed_error_rpm;      /* 转速误差 = target - feedback */
-  float output_current;       /* 速度环 PID 输出的转矩电流值 */
-  float kp;                   /* 当前使用的比例增益 (Kp) */
-  float ki;                   /* 当前使用的积分增益 (Ki) */
-  float kd;                   /* 当前使用的微分增益 (Kd) */
-  GM6020_ControlMode_t mode;  /* 当前控制模式 */
+  float target_speed_rpm;     /* 速度环目标转速 — target speed (rpm) */
+  float feedback_speed_rpm;   /* 电机反馈转速 — feedback speed (rpm) */
+  float speed_error_rpm;      /* 转速误差 — speed error = target - feedback */
+  float output_current;       /* 速度环 PID 输出的转矩电流值 — output torque current */
+  float kp;                   /* 当前使用的比例增益 — current proportional gain (Kp) */
+  float ki;                   /* 当前使用的积分增益 — current integral gain (Ki) */
+  float kd;                   /* 当前使用的微分增益 — current derivative gain (Kd) */
+  GM6020_ControlMode_t mode;  /* 当前控制模式 — current control mode */
 } GM6020_SpeedDebugData_t;
 
 /*
@@ -86,6 +127,22 @@ typedef struct
  * 返回 HAL_OK 表示成功，否则应调用 Error_Handler()。
  */
 HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan);
+
+/*
+ * 锁存式急停。
+ *
+ * 调用后立即把两轴 0x1FE 电流命令置零，并阻止位置/速度命令生效。
+ * 急停状态会保持到 GM6020_ClearEmergencyStop() 被显式调用。
+ */
+HAL_StatusTypeDef GM6020_EmergencyStop(void);
+
+/*
+ * 解除急停并锁定两轴当前位置，不恢复急停前的旧运动目标。
+ */
+void GM6020_ClearEmergencyStop(void);
+
+/* 查询当前是否处于锁存急停状态。 */
+bool GM6020_IsEmergencyStopped(void);
 
 /*
  * 设置单轴位置目标。
@@ -106,7 +163,7 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
 /*
  * 设置累计多圈位置目标。
  *
- * target_angle_deg 相对于该轴本次启动时的初始位置：
+ * target_angle_deg 相对于距离本次启动位置最近的编码器原始零点：
  *   360°  = 正向 1 圈
  *   1080° = 正向 3 圈
  *   -720° = 反向 2 圈
@@ -202,7 +259,7 @@ void GM6020_Process(void);
 const GM6020_Feedback_t *GM6020_GetFeedback(GM6020_Axis_t axis);
 
 /*
- * 获取相对于本次启动初始位置的累计多圈角度。
+ * 获取相对于编码器原始零点的累计多圈角度。
  * 编码器尚未初始化或参数无效时返回 false。
  */
 bool GM6020_GetMultiTurnPosition(

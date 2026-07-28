@@ -138,7 +138,7 @@ typedef struct
   /* ---- 编码器多圈追踪 ---- */
   uint16_t previous_encoder;           /* 上一拍的原始编码器值，用于跨零点检测 */
   bool encoder_initialized;            /* 编码器累计是否已初始化 */
-  int32_t multi_turn_origin_ecd;       /* 本次启动时的多圈位置零点 */
+  int32_t multi_turn_origin_ecd;       /* 距离启动位置最近的编码器零点 */
   bool multi_turn_origin_valid;        /* 多圈位置零点是否有效 */
 
   /* ---- 输出 ---- */
@@ -254,6 +254,7 @@ static const GM6020_AxisMechanicalConfig_t axis_mechanical_config[
 
 static CAN_HandleTypeDef *motor_can;                     /* CAN1 句柄指针 */
 static GM6020_Controller_t controllers[GM6020_AXIS_COUNT]; /* 两轴控制器实例 */
+static bool emergency_stop_latched;                     /* 串口锁存急停 */
 
 /*====================================================================
  * 通用工具函数
@@ -500,7 +501,10 @@ static void encoder_update(GM6020_Controller_t *controller,
 {
   int32_t delta;
 
-  /* 首次调用：以当前位置为零点，圈数 = 0 */
+  /*
+   * 首次调用：建立累计角度，并把最近的编码器原始零点作为多圈原点。
+   * 编码器位于后半圈时原点取 8192，否则取 0，与最短路径规则一致。
+   */
   if (!controller->encoder_initialized)
   {
     controller->previous_encoder = encoder;
@@ -509,7 +513,9 @@ static void encoder_update(GM6020_Controller_t *controller,
     controller->feedback.total_angle_deg =
         (float)encoder * 360.0f / (float)GM6020_ENCODER_CPR;
     controller->multi_turn_origin_ecd =
-        controller->feedback.total_angle_ecd;
+        (encoder > GM6020_ENCODER_HALF_CPR)
+        ? GM6020_ENCODER_CPR
+        : 0;
     controller->multi_turn_origin_valid = true;
     controller->encoder_initialized = true;
     return;
@@ -997,6 +1003,18 @@ static void controller_initialize(
   controller->maximum_angle_deg = mechanical->maximum_angle_deg;
   controller->angle_limit_enabled = mechanical->limit_enabled;
 
+  /*
+   * 上电默认目标为编码器原始零点。
+   * 首次收到反馈并进入位置控制时，单圈目标解析会从当前位置选择
+   * 到编码器 0 的最短路径（正反方向均不超过半圈）。
+   *
+   * 此处直接使用原始编码器角度 0，不叠加逻辑零位偏置；
+   * 后续外部位置命令仍按 GM6020_SetTargetPosition() 的逻辑零位处理。
+   */
+  controller->requested_angle_deg = 0.0f;
+  controller->requested_angle_is_multi_turn = false;
+  controller->position_target_valid = true;
+
   /* 初始状态：等待电机反馈 */
   controller->state = GM6020_STATE_WAIT_FEEDBACK;
 }
@@ -1078,6 +1096,7 @@ HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan)
   }
 
   motor_can = hcan;
+  emergency_stop_latched = false;
 
   for (axis_index = 0U;
        axis_index < (uint32_t)GM6020_AXIS_COUNT;
@@ -1115,6 +1134,69 @@ HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan)
   return gm6020_send_group_current();
 }
 
+HAL_StatusTypeDef GM6020_EmergencyStop(void)
+{
+  uint32_t axis_index;
+
+  emergency_stop_latched = true;
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    GM6020_Controller_t *controller = &controllers[axis_index];
+
+    controller->current_command = 0;
+    controller->target_speed_rpm = 0.0f;
+    controller->debug_target_speed_rpm = 0.0f;
+    controller->speed_debug_requested = false;
+    controller->position_target_valid = false;
+    controller->requested_angle_is_multi_turn = false;
+    speed_pid_reset(controller);
+    angle_pid_reset(controller);
+  }
+
+  if (motor_can == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  return gm6020_send_group_current();
+}
+
+void GM6020_ClearEmergencyStop(void)
+{
+  uint32_t axis_index;
+
+  emergency_stop_latched = false;
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    GM6020_Controller_t *controller = &controllers[axis_index];
+
+    controller->position_target_valid = false;
+    controller->requested_angle_is_multi_turn = false;
+    controller->speed_debug_requested = false;
+    controller->debug_target_speed_rpm = 0.0f;
+
+    if (controller->encoder_initialized && controller->feedback.online)
+    {
+      control_state_transition(
+          controller, GM6020_STATE_POSITION_CONTROL);
+    }
+    else
+    {
+      control_state_transition(
+          controller, GM6020_STATE_WAIT_FEEDBACK);
+    }
+  }
+}
+
+bool GM6020_IsEmergencyStopped(void)
+{
+  return emergency_stop_latched;
+}
+
 /*
  * 设置单轴位置目标。
  *
@@ -1139,7 +1221,9 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
   GM6020_Controller_t *controller;
   float limited_angle_deg;
 
-  if (!axis_is_valid(axis) || !isfinite(target_angle_deg))
+  if (emergency_stop_latched
+      || !axis_is_valid(axis)
+      || !isfinite(target_angle_deg))
   {
     return;
   }
@@ -1182,7 +1266,9 @@ void GM6020_SetMultiTurnTargetPosition(
 {
   GM6020_Controller_t *controller;
 
-  if (!axis_is_valid(axis) || !isfinite(target_angle_deg))
+  if (emergency_stop_latched
+      || !axis_is_valid(axis)
+      || !isfinite(target_angle_deg))
   {
     return;
   }
@@ -1236,7 +1322,9 @@ void GM6020_EnterSpeedDebug(GM6020_Axis_t axis,
 {
   GM6020_Controller_t *controller;
 
-  if (!axis_is_valid(axis) || !isfinite(target_speed_rpm))
+  if (emergency_stop_latched
+      || !axis_is_valid(axis)
+      || !isfinite(target_speed_rpm))
   {
     return;
   }
@@ -1273,7 +1361,9 @@ void GM6020_SetSpeedDebugTarget(GM6020_Axis_t axis,
 {
   GM6020_Controller_t *controller;
 
-  if (!axis_is_valid(axis) || !isfinite(target_speed_rpm))
+  if (emergency_stop_latched
+      || !axis_is_valid(axis)
+      || !isfinite(target_speed_rpm))
   {
     return;
   }
@@ -1534,8 +1624,19 @@ void GM6020_Process(void)
     controller->feedback.last_rx_ms = now;
     controller->feedback.online = true;
 
-    /* 运行该轴的状态机（PID 计算，更新 current_command） */
-    control_state_handle_feedback(controller);
+    /*
+     * 急停锁存期间仍更新编码器和在线状态，但禁止运行 PID，
+     * 并在每次反馈后继续发送零电流。
+     */
+    if (emergency_stop_latched)
+    {
+      controller->current_command = 0;
+      controller->target_speed_rpm = 0.0f;
+    }
+    else
+    {
+      control_state_handle_feedback(controller);
+    }
     command_changed = true;
   }
 
