@@ -12,6 +12,7 @@
 - 位置环、速度环串级 PID
 - 等待反馈、位置控制、速度调试、故障四状态控制
 - 反馈超时后零电流保护
+- USB CDC 双轴位置指令输入
 
 ## 硬件与通信
 
@@ -20,6 +21,7 @@
 | MCU | STM32F407 |
 | CAN1 | PD0 = RX，PD1 = TX，1 Mbps |
 | USART6 | PG9 = RX，PG14 = TX，115200-8-N-1 |
+| USB CDC | `yaw,pitch\r\n`，角度单位为度 |
 | Yaw反馈 | 标准帧 `0x205` |
 | Pitch反馈 | 标准帧 `0x206` |
 | 电流命令 | 标准帧 `0x1FE`，DLC = 8 |
@@ -35,6 +37,10 @@
 ## 程序流程
 
 ```text
+USB CDC接收
+    ↓
+control_in()
+    ↓
 GM6020_Process()
     ├─ 读取0x205/0x206反馈
     ├─ 更新多圈编码器
@@ -44,11 +50,27 @@ GM6020_Process()
     └─ 发送0x1FE合并电流帧
 ```
 
+## 双轴串口协议
+
+发送 ASCII 文本 `yaw,pitch\r\n`。Yaw 范围为 `-180~180` 度，
+Pitch 范围为 `-30~30` 度。命令有效时回复 `OK\r\n`，否则回复
+`ERR\r\n`。
+
+开发板每 100 ms 主动上报一次：
+
+```text
+FB,yaw角度,pitch角度,yaw转速,pitch转速,yaw在线,pitch在线\r\n
+```
+
+例如：`FB,12.34,-5.67,100,-20,1,1\r\n`。角度单位为度，转速单位为
+rpm，在线状态 `1` 表示近期收到对应电机的 CAN 反馈。
+
 ## 主要文件
 
 | 路径 | 用途 |
 | --- | --- |
 | `Core/Src/main.c` | 初始化和裸机主循环 |
+| `Core/Src/control_input.c` | USB CDC双轴串口指令解析 |
 | `Core/Src/motor_control.c` | 双轴状态机、编码器、PID和CAN控制 |
 | `Core/Inc/config/gimbal_params.h` | PID、零位、限位和超时参数 |
 | `CAN.ioc` | STM32CubeMX工程 |

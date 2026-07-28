@@ -20,15 +20,17 @@
 #include "main.h"
 #include "can.h"
 #include "usart.h"
+#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /*
  * 项目自定义模块：
+ *   control_input.h — USB CDC 双轴串口控制入口
  *   motor_control.h   — 双轴 GM6020 电机串级 PID 控制
- *   mouse_position_rx.h — 串口鼠标位置帧接收与解析
  */
+#include "control_input.h"
 #include "motor_control.h"
 /* USER CODE END Includes */
 
@@ -44,7 +46,7 @@
  * 速度环调试上电自启动配置。
  *
  * SPEED_LOOP_DEBUG_BOOT_ENABLE:
- *   0 — 正常模式：上电后进入位置控制（等待鼠标/串口目标角度）
+ *   0 — 正常模式：上电后进入位置控制（等待串口目标角度）
  *   1 — 调试模式：上电收到 CAN 反馈后自动进入速度环调试，
  *       绕过角度环，以固定 RPM 驱动电机。
  *
@@ -58,7 +60,7 @@
  *   调试模式下的初始目标转速（rpm），自动限幅到 ±200 RPM。
  *   正负方向由电机安装方向及编码器标定决定。
  */
-#define SPEED_LOOP_DEBUG_BOOT_ENABLE  1U
+#define SPEED_LOOP_DEBUG_BOOT_ENABLE  0U
 #define SPEED_LOOP_DEBUG_AXIS         GM6020_AXIS_YAW
 #define SPEED_LOOP_DEBUG_TARGET_RPM   100.0f
 
@@ -117,6 +119,8 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_USART6_UART_Init();
+  MX_CAN2_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
   /*
@@ -130,20 +134,12 @@ int main(void)
     Error_Handler();
   }
 
-  /*
-   * 初始化串口鼠标位置接收器。
-   * 启动 USART6 单字节中断接收，解析 PC 端发送的 8 字节角度帧。
-   * 必须在 MX_USART6_UART_Init() 之后调用。
-   */
-
-
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*
    * 上电自动进入速度环调试模式：
    *   1. 覆盖默认的 PID 增益（便于快速迭代调参）
    *   2. 进入速度调试模式，以固定 RPM 驱动指定轴
    *
-   * 调试期间鼠标位置帧仍会被接收和缓存，但不会干扰速度环。
    * 调参完成后将 SPEED_LOOP_DEBUG_BOOT_ENABLE 改回 0 即可。
    */
   (void)GM6020_SetSpeedPidGains(
@@ -164,20 +160,22 @@ int main(void)
     /*
      * 主循环调度（裸机，无 RTOS）：
      *
-     *   1. MousePositionRx_Process()
-     *      检查是否有来自 USART6 中断的新鼠标位置命令，
-     *      如果有则更新 Yaw 轴位置目标。
+     *   1. control_in()
+     *      处理 USB CDC 收到的双轴位置命令。
      *
      *   2. GM6020_Process()
      *      接收两轴 CAN 反馈 → 更新编码器 → 状态机 → PID 计算
      *      → 发送合并 0x1FE 电流命令。
      *
+     *   3. control_out()
+     *      每 100 ms 通过 USB CDC 上报一次双轴反馈。
+     *
      * 执行顺序说明：
-     *   先 MousePositionRx、后 GM6020 确保：
-     *   当前轮次收到的位置目标在同一轮次的 PID 计算中生效。
-     *   如果顺序颠倒，新的位置目标会延迟到下一个控制周期才生效。
+     *   先处理串口目标，再运行 GM6020 控制并上报最新反馈。
      */
+    control_in();
     GM6020_Process();
+    control_out();
   }
   /* USER CODE END 3 */
 }
@@ -199,15 +197,14 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 6;
   RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
