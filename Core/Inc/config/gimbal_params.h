@@ -16,8 +16,8 @@
 #define PITCH_CURRENT_COMMAND_SLOT      1U
 
 /*========================== Yaw 轴 PID 参数 ==========================*/
-#define YAW_SPEED_PID_KP                20.0f
-#define YAW_SPEED_PID_KI                15.0f
+#define YAW_SPEED_PID_KP                10.0f
+#define YAW_SPEED_PID_KI                0.0f
 #define YAW_SPEED_PID_KD                0.0f
 #define YAW_SPEED_PID_OUTPUT_LIMIT      8192.0f
 
@@ -28,7 +28,7 @@
 
 /*========================= Pitch 轴 PID 参数 =========================*/
 #define PITCH_SPEED_PID_KP              20.0f
-#define PITCH_SPEED_PID_KI              15.0f
+#define PITCH_SPEED_PID_KI              0.0f
 #define PITCH_SPEED_PID_KD              0.0f
 #define PITCH_SPEED_PID_OUTPUT_LIMIT    8192.0f
 

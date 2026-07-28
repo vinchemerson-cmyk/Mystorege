@@ -45,7 +45,6 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motor_control.c
-    Core/Src/mouse_position_rx.c
 )
 
 # Add include paths

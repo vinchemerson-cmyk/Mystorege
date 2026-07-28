@@ -30,7 +30,6 @@
  *   mouse_position_rx.h — 串口鼠标位置帧接收与解析
  */
 #include "motor_control.h"
-#include "mouse_position_rx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -136,10 +135,7 @@ int main(void)
    * 启动 USART6 单字节中断接收，解析 PC 端发送的 8 字节角度帧。
    * 必须在 MX_USART6_UART_Init() 之后调用。
    */
-  if (MousePositionRx_Init(&huart6) != HAL_OK)
-  {
-    Error_Handler();
-  }
+
 
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*
@@ -181,7 +177,6 @@ int main(void)
      *   当前轮次收到的位置目标在同一轮次的 PID 计算中生效。
      *   如果顺序颠倒，新的位置目标会延迟到下一个控制周期才生效。
      */
-    MousePositionRx_Process();
     GM6020_Process();
   }
   /* USER CODE END 3 */

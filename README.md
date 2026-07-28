@@ -1,8 +1,7 @@
 # STM32F407 双轴 GM6020 云台控制
 
 基于 STM32F407 和 HAL 库的双轴云台控制工程。Yaw、Pitch 两台 GM6020
-共用 CAN1，通过位置环与速度环串级 PID 输出合并电流命令；USART6 可接收
-PC 端发送的鼠标目标角度。
+共用 CAN1，通过位置环与速度环串级 PID 输出合并电流命令。
 
 ## 当前功能
 
@@ -13,7 +12,6 @@ PC 端发送的鼠标目标角度。
 - 位置环、速度环串级 PID
 - 等待反馈、位置控制、速度调试、故障四状态控制
 - 反馈超时后零电流保护
-- USART6 鼠标位置帧解析
 
 ## 硬件与通信
 
@@ -37,12 +35,6 @@ PC 端发送的鼠标目标角度。
 ## 程序流程
 
 ```text
-USART6中断接收
-    ↓
-MousePositionRx_Process()
-    ↓
-更新Yaw目标角度
-    ↓
 GM6020_Process()
     ├─ 读取0x205/0x206反馈
     ├─ 更新多圈编码器
@@ -52,28 +44,12 @@ GM6020_Process()
     └─ 发送0x1FE合并电流帧
 ```
 
-## 鼠标串口协议
-
-每帧8字节，小端序：
-
-| 字节 | 内容 |
-| --- | --- |
-| `0` | `0xAA` |
-| `1` | `0x55` |
-| `2:5` | IEEE 754 `float`目标角度，单位：度 |
-| `6` | 保留，必须为`0x00` |
-| `7` | Byte 0至6的XOR校验 |
-
-当前协议只更新Yaw目标；Pitch可通过
-`GM6020_SetGimbalPosition()` 或扩展双角度协议控制。
-
 ## 主要文件
 
 | 路径 | 用途 |
 | --- | --- |
 | `Core/Src/main.c` | 初始化和裸机主循环 |
 | `Core/Src/motor_control.c` | 双轴状态机、编码器、PID和CAN控制 |
-| `Core/Src/mouse_position_rx.c` | USART6鼠标指令解析 |
 | `Core/Inc/config/gimbal_params.h` | PID、零位、限位和超时参数 |
 | `CAN.ioc` | STM32CubeMX工程 |
 

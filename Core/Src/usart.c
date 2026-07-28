@@ -36,7 +36,7 @@ void MX_USART6_UART_Init(void)
   /* USER CODE END USART6_Init 0 */
 
   /* USER CODE BEGIN USART6_Init 1 */
-  /* USART6 用于接收 PC 鼠标位置命令，配置为 115200-8-N-1。 */
+  /* USART6 配置为 115200-8-N-1。 */
   /* USER CODE END USART6_Init 1 */
   huart6.Instance = USART6;
   huart6.Init.BaudRate = 115200;
@@ -81,7 +81,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 
   /* USER CODE BEGIN USART6_MspInit 1 */
-    /* 鼠标位置帧采用逐字节中断接收。 */
+    /* USART6 全局中断。 */
     HAL_NVIC_SetPriority(USART6_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART6_IRQn);
   /* USER CODE END USART6_MspInit 1 */
