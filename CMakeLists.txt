@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motor_control.c
     Core/Src/control_input.c
+    Core/Src/chassis_can.c
 )
 
 # Add include paths

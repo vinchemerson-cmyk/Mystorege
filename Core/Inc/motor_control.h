@@ -104,6 +104,20 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
                               float target_angle_deg);
 
 /*
+ * 设置累计多圈位置目标。
+ *
+ * target_angle_deg 相对于该轴本次启动时的初始位置：
+ *   360°  = 正向 1 圈
+ *   1080° = 正向 3 圈
+ *   -720° = 反向 2 圈
+ *
+ * 该接口不做单圈归一化，也不按劣弧选择路径。
+ */
+void GM6020_SetMultiTurnTargetPosition(
+    GM6020_Axis_t axis,
+    float target_angle_deg);
+
+/*
  * 在同一次业务调用中同时更新 Yaw 和 Pitch 两轴的位置目标。
  *
  * 等价于：
@@ -186,6 +200,14 @@ void GM6020_Process(void);
  * 用途：调试观察、串口上报、上位机监控。
  */
 const GM6020_Feedback_t *GM6020_GetFeedback(GM6020_Axis_t axis);
+
+/*
+ * 获取相对于本次启动初始位置的累计多圈角度。
+ * 编码器尚未初始化或参数无效时返回 false。
+ */
+bool GM6020_GetMultiTurnPosition(
+    GM6020_Axis_t axis,
+    float *position_deg);
 
 #ifdef __cplusplus
 }

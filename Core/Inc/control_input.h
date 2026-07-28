@@ -15,7 +15,8 @@ void control_in_receive(const uint8_t *data, uint32_t length);
 
 /*
  * 双轴串口控制入口。
- * 在主循环中调用，解析 "yaw,pitch\r\n" 并更新两个电机的位置目标。
+ * 在主循环中调用，解析 "yaw,pitch\r\n"。
+ * Yaw 为相对启动位置的累计多圈角度，Pitch 为单圈位置目标。
  */
 void control_in(void);
 

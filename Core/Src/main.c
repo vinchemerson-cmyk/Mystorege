@@ -27,9 +27,11 @@
 /* USER CODE BEGIN Includes */
 /*
  * 项目自定义模块：
+ *   chassis_can.h — CAN2底盘控制命令发送
  *   control_input.h — USB CDC 双轴串口控制入口
  *   motor_control.h   — 双轴 GM6020 电机串级 PID 控制
  */
+#include "chassis_can.h"
 #include "control_input.h"
 #include "motor_control.h"
 /* USER CODE END Includes */
@@ -134,6 +136,11 @@ int main(void)
     Error_Handler();
   }
 
+  if (ChassisCAN_Init(&hcan2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*
    * 上电自动进入速度环调试模式：
@@ -170,12 +177,16 @@ int main(void)
      *   3. control_out()
      *      每 100 ms 通过 USB CDC 上报一次双轴反馈。
      *
+     *   4. ChassisCAN_Process()
+     *      每 10 ms 通过 CAN2 发送底盘控制量帧和模式帧。
+     *
      * 执行顺序说明：
      *   先处理串口目标，再运行 GM6020 控制并上报最新反馈。
      */
     control_in();
     GM6020_Process();
     control_out();
+    ChassisCAN_Process();
   }
   /* USER CODE END 3 */
 }

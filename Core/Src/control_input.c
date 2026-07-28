@@ -13,8 +13,8 @@
 #define CONTROL_IN_LINE_CAPACITY    48U
 #define CONTROL_OUT_BUFFER_CAPACITY 96U
 #define CONTROL_OUT_PERIOD_MS       1000U
-#define CONTROL_IN_YAW_MIN_DEG    (-180.0f)
-#define CONTROL_IN_YAW_MAX_DEG      180.0f
+#define CONTROL_IN_YAW_MIN_DEG    (-36000.0f)
+#define CONTROL_IN_YAW_MAX_DEG      36000.0f
 #define CONTROL_IN_PITCH_MIN_DEG  (-30.0f)
 #define CONTROL_IN_PITCH_MAX_DEG    30.0f
 
@@ -213,7 +213,10 @@ void control_in(void)
   if (!line_invalid
       && parse_target_pair(line, &yaw_angle_deg, &pitch_angle_deg))
   {
-    GM6020_SetGimbalPosition(yaw_angle_deg, pitch_angle_deg);
+    GM6020_SetMultiTurnTargetPosition(
+        GM6020_AXIS_YAW, yaw_angle_deg);
+    GM6020_SetTargetPosition(
+        GM6020_AXIS_PITCH, pitch_angle_deg);
     pending_ack = CONTROL_ACK_OK;
   }
   else
@@ -268,6 +271,7 @@ void control_out(void)
   const uint32_t now = HAL_GetTick();
   const GM6020_Feedback_t *yaw_feedback;
   const GM6020_Feedback_t *pitch_feedback;
+  float yaw_multi_turn_deg;
   char yaw_angle[20];
   char pitch_angle[20];
   int length;
@@ -286,8 +290,14 @@ void control_out(void)
     return;
   }
 
+  if (!GM6020_GetMultiTurnPosition(
+          GM6020_AXIS_YAW, &yaw_multi_turn_deg))
+  {
+    yaw_multi_turn_deg = 0.0f;
+  }
+
   format_angle(yaw_angle, sizeof(yaw_angle),
-               yaw_feedback->total_angle_deg);
+               yaw_multi_turn_deg);
   format_angle(pitch_angle, sizeof(pitch_angle),
                pitch_feedback->total_angle_deg);
 

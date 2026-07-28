@@ -48,7 +48,7 @@
  * Yaw 逻辑角度软限位。当前 ±180° 是占位值，必须根据实际线材和机械
  * 干涉范围缩小，例如 -120°~120°。
  */
-#define YAW_ANGLE_LIMIT_ENABLE          1U
+#define YAW_ANGLE_LIMIT_ENABLE          0U
 #define YAW_MIN_ANGLE_DEG              (-180.0f)
 #define YAW_MAX_ANGLE_DEG               180.0f
 

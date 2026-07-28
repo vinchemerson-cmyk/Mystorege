@@ -130,13 +130,16 @@ typedef struct
   bool speed_debug_requested;         /* 是否正在/请求进入速度调试模式 */
 
   /* ---- 位置命令 ---- */
-  float requested_angle_deg;          /* 限幅并叠加零偏后的电机单圈目标角度 */
-  bool position_target_valid;         /* 是否有有效的位置目标 */
-  int32_t target_total_angle_ecd;     /* 解析后的多圈编码器目标值 */
+  float requested_angle_deg;           /* 单圈角度或累计多圈角度目标 */
+  bool requested_angle_is_multi_turn;  /* true：累计多圈；false：单圈劣弧 */
+  bool position_target_valid;          /* 是否有有效的位置目标 */
+  int32_t target_total_angle_ecd;      /* 解析后的多圈编码器目标值 */
 
   /* ---- 编码器多圈追踪 ---- */
-  uint16_t previous_encoder;          /* 上一拍的原始编码器值，用于跨零点检测 */
-  bool encoder_initialized;           /* 编码器累计是否已初始化 */
+  uint16_t previous_encoder;           /* 上一拍的原始编码器值，用于跨零点检测 */
+  bool encoder_initialized;            /* 编码器累计是否已初始化 */
+  int32_t multi_turn_origin_ecd;       /* 本次启动时的多圈位置零点 */
+  bool multi_turn_origin_valid;        /* 多圈位置零点是否有效 */
 
   /* ---- 输出 ---- */
   int16_t current_command;            /* 当前转矩电流命令（±16384） */
@@ -441,6 +444,43 @@ static void angle_resolve_single_turn_target(
 }
 
 /*
+ * 将累计角度目标换算为相对于启动位置的多圈编码器目标。
+ *
+ * 与单圈目标不同，本函数不进行 0~360° 归一化，也不选择劣弧。
+ * 例如 1080° 会固定解析为从启动位置正向转动 3 圈。
+ */
+static void angle_resolve_multi_turn_target(
+    GM6020_Controller_t *controller,
+    float accumulated_angle_deg)
+{
+  double target_encoder;
+
+  if (!controller->encoder_initialized
+      || !controller->multi_turn_origin_valid)
+  {
+    return;
+  }
+
+  target_encoder =
+      (double)controller->multi_turn_origin_ecd
+      + (double)accumulated_angle_deg
+          * (double)GM6020_ENCODER_CPR / 360.0;
+
+  if ((target_encoder > (double)INT32_MAX)
+      || (target_encoder < (double)INT32_MIN))
+  {
+    return;
+  }
+
+  controller->target_total_angle_ecd =
+      (int32_t)((target_encoder >= 0.0)
+          ? (target_encoder + 0.5)
+          : (target_encoder - 0.5));
+
+  angle_pid_reset(controller);
+}
+
+/*
  * 增量式编码器多圈累计更新。
  *
  * 【算法】
@@ -468,6 +508,9 @@ static void encoder_update(GM6020_Controller_t *controller,
     controller->feedback.total_angle_ecd = encoder;
     controller->feedback.total_angle_deg =
         (float)encoder * 360.0f / (float)GM6020_ENCODER_CPR;
+    controller->multi_turn_origin_ecd =
+        controller->feedback.total_angle_ecd;
+    controller->multi_turn_origin_valid = true;
     controller->encoder_initialized = true;
     return;
   }
@@ -792,10 +835,18 @@ static void control_state_transition(
       angle_pid_reset(controller);
       if (controller->position_target_valid)
       {
-        /* 有有效的目标位置 → 解析为多圈目标 */
-        angle_resolve_single_turn_target(
-            controller,
-            controller->requested_angle_deg);
+        if (controller->requested_angle_is_multi_turn)
+        {
+          angle_resolve_multi_turn_target(
+              controller,
+              controller->requested_angle_deg);
+        }
+        else
+        {
+          angle_resolve_single_turn_target(
+              controller,
+              controller->requested_angle_deg);
+        }
       }
       else
       {
@@ -808,6 +859,7 @@ static void control_state_transition(
         controller->requested_angle_deg =
             normalize_single_turn_degrees(
                 controller->feedback.total_angle_deg);
+        controller->requested_angle_is_multi_turn = false;
       }
       break;
 
@@ -1112,12 +1164,37 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
   controller->requested_angle_deg =
       normalize_single_turn_degrees(
           limited_angle_deg + controller->zero_offset_deg);
+  controller->requested_angle_is_multi_turn = false;
   controller->position_target_valid = true;
 
   /* 步骤3：如果已在位置控制，立即解析目标 */
   if (controller->state == GM6020_STATE_POSITION_CONTROL)
   {
     angle_resolve_single_turn_target(
+        controller,
+        controller->requested_angle_deg);
+  }
+}
+
+void GM6020_SetMultiTurnTargetPosition(
+    GM6020_Axis_t axis,
+    float target_angle_deg)
+{
+  GM6020_Controller_t *controller;
+
+  if (!axis_is_valid(axis) || !isfinite(target_angle_deg))
+  {
+    return;
+  }
+
+  controller = &controllers[axis];
+  controller->requested_angle_deg = target_angle_deg;
+  controller->requested_angle_is_multi_turn = true;
+  controller->position_target_valid = true;
+
+  if (controller->state == GM6020_STATE_POSITION_CONTROL)
+  {
+    angle_resolve_multi_turn_target(
         controller,
         controller->requested_angle_deg);
   }
@@ -1244,6 +1321,7 @@ void GM6020_ExitSpeedDebug(GM6020_Axis_t axis)
   controller->debug_target_speed_rpm = 0.0f;
   controller->target_speed_rpm = 0.0f;
   controller->position_target_valid = false;
+  controller->requested_angle_is_multi_turn = false;
 
   if (controller->state == GM6020_STATE_SPEED_DEBUG)
   {
@@ -1509,4 +1587,29 @@ const GM6020_Feedback_t *GM6020_GetFeedback(GM6020_Axis_t axis)
     return NULL;
   }
   return &controllers[axis].feedback;
+}
+
+bool GM6020_GetMultiTurnPosition(
+    GM6020_Axis_t axis,
+    float *position_deg)
+{
+  const GM6020_Controller_t *controller;
+
+  if (!axis_is_valid(axis) || (position_deg == NULL))
+  {
+    return false;
+  }
+
+  controller = &controllers[axis];
+  if (!controller->encoder_initialized
+      || !controller->multi_turn_origin_valid)
+  {
+    return false;
+  }
+
+  *position_deg =
+      (float)(controller->feedback.total_angle_ecd
+              - controller->multi_turn_origin_ecd)
+      * 360.0f / (float)GM6020_ENCODER_CPR;
+  return true;
 }
