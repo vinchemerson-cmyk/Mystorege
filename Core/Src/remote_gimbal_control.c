@@ -37,7 +37,7 @@
 #define REMOTE_GIMBAL_FULL_SCALE           660
 
 /* 满杆对应的云台逻辑目标角速度 */
-#define REMOTE_GIMBAL_YAW_MAX_RATE_DPS    180.0f
+#define REMOTE_GIMBAL_YAW_MAX_RATE_DPS    360.0f
 #define REMOTE_GIMBAL_PITCH_MAX_RATE_DPS   30.0f
 
 /*
