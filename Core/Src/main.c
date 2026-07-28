@@ -19,69 +19,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "can.h"
+#include "dma.h"
 #include "usart.h"
 #include "usb_device.h"
 #include "gpio.h"
-
-/**
- * ===========================================================================
- * @file    main.c
- * @brief   主程序入口 — 双轴 GM6020 云台 + CAN 底盘控制
- * ===========================================================================
- *
- * 【系统概述】
- *   本系统是基于 STM32F407 的两轴云台控制器，使用 DJI GM6020 无刷直流
- *   电机作为 Yaw（偏航）和 Pitch（俯仰）驱动，通过 CAN 总线通信。
- *   同时通过 CAN2 向底盘发送运动控制指令。
- *
- * 【硬件架构】
- *   ┌───────────────────────────────────────────────────┐
- *   │                  STM32F407                        │
- *   │  CAN1 ──────── GM6020 Yaw  (ID1, 反馈 0x205)      │
- *   │           └─── GM6020 Pitch (ID2, 反馈 0x206)      │
- *   │  CAN2 ──────── 底盘控制器 (命令 0x300, 模式 0x301) │
- *   │  USB_OTG_FS ── USB CDC 虚拟串口 (上位机通信)       │
- *   │  USART6 ────── 串口调试 (115200-8-N-1)             │
- *   └───────────────────────────────────────────────────┘
- *
- * 【主循环调度（裸机，无 RTOS）】
- *   在 while(1) 主循环中按固定顺序执行四个模块的调度函数：
- *     1. control_in()        — 处理上位机串口命令（目标角度/急停/清除）
- *     2. GM6020_Process()    — CAN 反馈接收 → 编码器多圈累计 → 状态机
- *                              → 串级 PID → 发送电流命令 (~1 kHz)
- *     3. control_out()       — 通过 USB CDC 上报双轴角度和状态 (~1 Hz)
- *     4. ChassisCAN_Process() — CAN2 底盘控制命令周期发送 (~100 Hz)
- *
- * 【控制模式】
- *   正常模式 (SPEED_LOOP_DEBUG_BOOT_ENABLE=0):
- *     上电 → 等待 CAN 反馈 → 进入角度+速度串级位置控制 →
- *     通过 USB 虚拟串口接收 "yaw,pitch\r\n" 格式的目标角度命令。
- *
- *   调试模式 (SPEED_LOOP_DEBUG_BOOT_ENABLE=1):
- *     上电 → 等待 CAN 反馈 → 自动进入速度环调试模式 →
- *     绕过角度环，以固定 RPM 驱动指定轴（用于 PID 参数整定）。
- *
- * 【通讯协议】
- *   上位机 → MCU (USB CDC):
- *     "123.45,-15.30\r\n"  — Yaw=123.45°, Pitch=-15.30°（累计多圈+单圈）
- *     "ESTOP\r\n"          — 立即急停（锁存）
- *     "CLEAR\r\n"           — 解除急停
- *
- *   MCU → 上位机 (USB CDC):
- *     "FB,<yaw>,<pitch>,<yaw_rpm>,<pitch_rpm>,<yaw_on>,<pitch_on>,<estop>\r\n"
- *     每 1000 ms 上报一次。
- *
- * 【CAN 时钟说明】
- *   APB1 = HCLK/4 = 168/4 = 42 MHz
- *   CAN 波特率 = 42 MHz / Prescaler / (1 + BS1 + BS2)
- *              = 42 MHz / 2 / (1 + 16 + 4) = 1 Mbps
- *
- * 【关键配置】
- *   - HSE: 8 MHz → PLL: 168 MHz (HCLK)
- *   - gimbal_params.h: Yaw/Pitch CAN ID、PID 增益、零位偏置、软限位
- *   - chassis_can_config.h: 底盘 CAN ID、Q10 缩放因子、发送周期
- * ===========================================================================
- */
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -89,11 +30,18 @@
  * 项目自定义模块：
  *   chassis_can.h  — CAN2 底盘控制命令发送 (Chassis CAN2 command transmission)
  *   control_input.h — USB CDC 双轴串口控制入口 (USB CDC serial control interface)
+ *   dbus_monitor.h — DBUS 数据 USB CDC 调试输出
+ *   gimbal_calibration.h — 双轴上电自动机械零位采样
  *   motor_control.h — 双轴 GM6020 电机串级 PID 控制 (GM6020 cascaded PID control)
+ *   remote_gimbal_control.h — DBUS 摇杆到双轴云台位置目标的映射
  */
 #include "chassis_can.h"
 #include "control_input.h"
+#include "dbus.h"
+#include "dbus_monitor.h"
+#include "gimbal_calibration.h"
 #include "motor_control.h"
+#include "remote_gimbal_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -177,20 +125,14 @@ int main(void)
 
   /* USER CODE END SysInit */
 
-  /* ---- 阶段1：HAL 外设初始化 ---- */
-  /*
-   * 初始化顺序说明：
-   *   GPIO → CAN → USART → USB 的顺序遵循依赖关系：
-   *   1. GPIO 最底层，为其他外设提供引脚配置
-   *   2. CAN1 必须在 GM6020_Init() 之前初始化（电机控制依赖 CAN1 句柄）
-   *   3. CAN2 必须在 ChassisCAN_Init() 之前初始化（底盘控制依赖 CAN2 句柄）
-   *   4. USART6 和 USB 顺序无关紧要（没有互相依赖）
-   */
-  MX_GPIO_Init();          /* 初始化所有 GPIO 引脚（时钟+复用功能） */
-  MX_CAN1_Init();          /* CAN1: PD0(RX), PD1(TX), 1 Mbps  — 电机总线 */
-  MX_USART6_UART_Init();   /* USART6: PG9(RX), PG14(TX), 115200 — 调试串口 */
-  MX_CAN2_Init();          /* CAN2: PB5(RX), PB6(TX), 1 Mbps  — 底盘总线 */
-  MX_USB_DEVICE_Init();    /* USB OTG FS: PA11(DM), PA12(DP) — 虚拟串口 */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_CAN1_Init();
+  MX_USART6_UART_Init();
+  MX_CAN2_Init();
+  MX_USB_DEVICE_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* ---- 阶段2：业务模块初始化 ---- */
@@ -206,6 +148,7 @@ int main(void)
   {
     Error_Handler();
   }
+  GimbalCalibration_Init();
 
   /*
    * 初始化 CAN2 底盘发送通道。
@@ -215,6 +158,16 @@ int main(void)
   {
     Error_Handler();
   }
+
+  /*
+   * 启动开发板 C 型板载 DBUS 接口：
+   * DBUS -> 板载反相电路 -> PC11/USART3_RX -> DMA1 Stream1。
+   */
+  if (DBUS_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  RemoteGimbalControl_Init();
 
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*
@@ -242,22 +195,35 @@ int main(void)
     /*
      * ┌────────── 主循环调度（裸机循环，无 RTOS） ──────────┐
      * │                                                      │
-     * │  1. control_in()          ~异步（有数据时才动作）     │
+     * │  1. DBUS_Process()        ~每个主循环                 │
+     * │     取出最新18字节帧并解析4通道摇杆和2个开关           │
+     * │     → 范围校验 → 在线状态更新                          │
+     * │                                                      │
+     * │  2. control_in()          ~异步（有数据时才动作）     │
      * │     解析 USB CDC 收到的双轴位置命令 "yaw,pitch\r\n"  │
      * │     或紧急命令 "ESTOP\r\n" / "CLEAR\r\n"             │
      * │     收到有效命令后发送 ACK 回复。                     │
      * │                                                      │
-     * │  2. GM6020_Process()      ~1 kHz (由电机反馈驱动)     │
+     * │  3. GM6020_Process()      ~1 kHz (由电机反馈驱动)     │
      * │     接收 CAN RX FIFO 中积压的反馈帧                   │
      * │     → 匹配 StdId (0x205/0x206) → 更新编码器多圈累计  │
      * │     → 状态机 (WAIT→POSITION/SPEED_DEBUG→FAULT)       │
      * │     → 角度环 PID → 速度环 PID → 打包 0x1FE 电流帧    │
      * │                                                      │
-     * │  3. control_out()         ~1 Hz (1000 ms 周期)       │
-     * │     通过 USB CDC 上报反馈帧 "FB,..."                  │
-     * │     包含 Yaw/Pitch 多圈角度、转速、在线状态、急停状态  │
+     * │  4. GimbalCalibration_Process()                      │
+     * │     上电采集两轴各100个新的静止反馈并设为机械零点      │
      * │                                                      │
-     * │  4. ChassisCAN_Process()  ~100 Hz (10 ms 周期)        │
+     * │  5. RemoteGimbalControl_Process()                    │
+     * │     单轴测试模式下仅CH0积分为Yaw多圈位置目标            │
+     * │     Pitch电流强制为0，掉线/急停/未标定时不更新目标      │
+     * │                                                      │
+     * │  6. control_out()         当前暂停                   │
+     * │     暂停 "FB,..." 周期上报，避免与 DBUS 调试数据混合   │
+     * │                                                      │
+     * │  7. DBUS_Monitor_Process() ~20 Hz (50 ms 周期)        │
+     * │     通过 USB CDC 输出 "RC,..." 遥控器调试数据          │
+     * │                                                      │
+     * │  8. ChassisCAN_Process()  ~100 Hz (10 ms 周期)        │
      * │     通过 CAN2 发送底盘控制量帧 + 模式帧               │
      * │                                                      │
      * │  【执行顺序合理性】                                   │
@@ -266,27 +232,20 @@ int main(void)
      * │   命令解析 → PID 计算 → 电流输出 → 反馈上报。         │
      * └──────────────────────────────────────────────────────┘
      */
+    DBUS_Process();
     control_in();
     GM6020_Process();
-    control_out();
+    GimbalCalibration_Process();
+    RemoteGimbalControl_Process();
+    /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 */
+    DBUS_Monitor_Process();
     ChassisCAN_Process();
   }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief  System Clock Configuration — 系统时钟配置
-  * @note   System Clock source    = PLL (HSE)
-  *         SYSCLK  = HSE / PLLM * PLLN / PLLP = 8 / 6 * 168 / 2 = 168 MHz
-  *         HCLK    = SYSCLK / AHB_DIV = 168 / 1 = 168 MHz
-  *         PCLK1   = HCLK / APB1_DIV = 168 / 4 = 42 MHz  (APB1 总线, CAN/UART/I2C/SPI)
-  *         PCLK2   = HCLK / APB2_DIV = 168 / 2 = 84 MHz  (APB2 总线, 高速外设)
-  *         USB/48M = PLLQ = 7 → VCO/PLLQ = (8*168/6)/7 = 48 MHz (USB FS 专用时钟)
-  *
-  *         关键外设时钟：
-  *           CAN1/2    ← APB1 = 42 MHz
-  *           USART6    ← APB2 = 84 MHz
-  *           SysTick   ← HCLK/8 = 21 MHz (HAL 1ms 时基)
+  * @brief System Clock Configuration
   * @retval None
   */
 void SystemClock_Config(void)
@@ -335,13 +294,7 @@ void SystemClock_Config(void)
 /* USER CODE END 4 */
 
 /**
-  * @brief  错误处理函数 — 当 HAL 库检测到不可恢复错误时调用。
-  *         关闭全局中断后进入死循环，等待看门狗复位或手动断电。
-  * @note   在生产环境中可以在此处添加：
-  *         1. 保存错误现场到备份寄存器 (BKP)
-  *         2. 通过 CAN 发送紧急停机广播
-  *         3. 闪烁板载 LED 指示错误码
-  *         4. 触发独立看门狗复位
+  * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
 void Error_Handler(void)

@@ -45,9 +45,9 @@
  *   控制周期 0.001 s = 1 kHz（由电机反馈帧发送频率决定）
  */
 #define GM6020_CURRENT_COMMAND_ID     0x1FEU
-#define GM6020_ENCODER_CPR            8192
-#define GM6020_ENCODER_HALF_CPR       4096
+#define GM6020_ENCODER_HALF_CPR       ((int32_t)(GM6020_ENCODER_CPR / 2U))
 #define GM6020_CONTROL_PERIOD_S       0.001f
+#define GM6020_ZERO_SET_MAX_SPEED_RPM 2
 
 /*
  * 控制状态机枚举。
@@ -445,10 +445,10 @@ static void angle_resolve_single_turn_target(
 }
 
 /*
- * 将累计角度目标换算为相对于启动位置的多圈编码器目标。
+ * 将累计角度目标换算为相对于标定机械零点的多圈编码器目标。
  *
  * 与单圈目标不同，本函数不进行 0~360° 归一化，也不选择劣弧。
- * 例如 1080° 会固定解析为从启动位置正向转动 3 圈。
+ * 例如 1080° 会固定解析为从标定零点正向转动 3 圈。
  */
 static void angle_resolve_multi_turn_target(
     GM6020_Controller_t *controller,
@@ -482,6 +482,40 @@ static void angle_resolve_multi_turn_target(
 }
 
 /*
+ * 返回与当前累计位置距离最近的“标定机械零点”累计编码器值。
+ * zero_offset_deg 表示逻辑 0° 对应的单圈编码器位置。
+ */
+static int32_t encoder_nearest_calibrated_zero(
+    const GM6020_Controller_t *controller,
+    int32_t current_total_ecd,
+    uint16_t current_single_turn_ecd)
+{
+  const float normalized_zero =
+      normalize_single_turn_degrees(controller->zero_offset_deg);
+  uint32_t zero_ecd = (uint32_t)(
+      normalized_zero * (float)GM6020_ENCODER_CPR / 360.0f
+      + 0.5f);
+  int32_t delta;
+
+  if (zero_ecd >= GM6020_ENCODER_CPR)
+  {
+    zero_ecd = 0U;
+  }
+
+  delta = (int32_t)zero_ecd - (int32_t)current_single_turn_ecd;
+  if (delta > (int32_t)GM6020_ENCODER_HALF_CPR)
+  {
+    delta -= (int32_t)GM6020_ENCODER_CPR;
+  }
+  else if (delta < -(int32_t)GM6020_ENCODER_HALF_CPR)
+  {
+    delta += (int32_t)GM6020_ENCODER_CPR;
+  }
+
+  return current_total_ecd + delta;
+}
+
+/*
  * 增量式编码器多圈累计更新。
  *
  * 【算法】
@@ -502,8 +536,8 @@ static void encoder_update(GM6020_Controller_t *controller,
   int32_t delta;
 
   /*
-   * 首次调用：建立累计角度，并把最近的编码器原始零点作为多圈原点。
-   * 编码器位于后半圈时原点取 8192，否则取 0，与最短路径规则一致。
+   * 首次调用：建立累计角度，并把距离当前位置最近的标定机械零点
+   * 作为多圈坐标原点。
    */
   if (!controller->encoder_initialized)
   {
@@ -513,9 +547,10 @@ static void encoder_update(GM6020_Controller_t *controller,
     controller->feedback.total_angle_deg =
         (float)encoder * 360.0f / (float)GM6020_ENCODER_CPR;
     controller->multi_turn_origin_ecd =
-        (encoder > GM6020_ENCODER_HALF_CPR)
-        ? GM6020_ENCODER_CPR
-        : 0;
+        encoder_nearest_calibrated_zero(
+            controller,
+            controller->feedback.total_angle_ecd,
+            encoder);
     controller->multi_turn_origin_valid = true;
     controller->encoder_initialized = true;
     return;
@@ -725,8 +760,21 @@ static HAL_StatusTypeDef gm6020_send_group_current(void)
        axis_index < (uint32_t)GM6020_AXIS_COUNT;
        ++axis_index)
   {
-    const uint16_t raw =
-        (uint16_t)controllers[axis_index].current_command;
+    int16_t current_command =
+        controllers[axis_index].current_command;
+
+#if GIMBAL_YAW_ONLY_TEST_MODE
+    /*
+     * 单轴测试期间，即使 Pitch 意外收到反馈并运行了内部状态机，
+     * 发到 0x1FE 的 Pitch 电流槽也始终保持为 0。
+     */
+    if (axis_index == (uint32_t)GM6020_AXIS_PITCH)
+    {
+      current_command = 0;
+    }
+#endif
+
+    const uint16_t raw = (uint16_t)current_command;
     const uint32_t offset =
         (uint32_t)axis_can_config[axis_index].current_slot * 2U;
     tx_data[offset] = (uint8_t)(raw >> 8);       /* 大端高字节 */
@@ -1004,16 +1052,13 @@ static void controller_initialize(
   controller->angle_limit_enabled = mechanical->limit_enabled;
 
   /*
-   * 上电默认目标为编码器原始零点。
-   * 首次收到反馈并进入位置控制时，单圈目标解析会从当前位置选择
-   * 到编码器 0 的最短路径（正反方向均不超过半圈）。
-   *
-   * 此处直接使用原始编码器角度 0，不叠加逻辑零位偏置；
-   * 后续外部位置命令仍按 GM6020_SetTargetPosition() 的逻辑零位处理。
+   * 上电不主动运动。首次收到反馈并进入位置控制时，因为尚无外部
+   * 位置目标，状态机会锁定反馈中的当前位置。这样装机标定前不会
+   * 自动转向编码器原始零点。
    */
   controller->requested_angle_deg = 0.0f;
   controller->requested_angle_is_multi_turn = false;
-  controller->position_target_valid = true;
+  controller->position_target_valid = false;
 
   /* 初始状态：等待电机反馈 */
   controller->state = GM6020_STATE_WAIT_FEEDBACK;
@@ -1195,6 +1240,119 @@ void GM6020_ClearEmergencyStop(void)
 bool GM6020_IsEmergencyStopped(void)
 {
   return emergency_stop_latched;
+}
+
+static bool zero_offset_can_be_applied(
+    const GM6020_Controller_t *controller)
+{
+  if (controller == NULL)
+  {
+    return false;
+  }
+
+  return !controller->encoder_initialized
+      || (controller->feedback.online
+          && (controller->feedback.speed_rpm
+              <= GM6020_ZERO_SET_MAX_SPEED_RPM)
+          && (controller->feedback.speed_rpm
+              >= -GM6020_ZERO_SET_MAX_SPEED_RPM));
+}
+
+static void apply_zero_offset_ecd(
+    GM6020_Controller_t *controller,
+    uint16_t zero_ecd)
+{
+  controller->zero_offset_deg =
+      (float)zero_ecd * 360.0f
+      / (float)GM6020_ENCODER_CPR;
+  controller->position_target_valid = false;
+  controller->requested_angle_deg = 0.0f;
+  controller->requested_angle_is_multi_turn = false;
+  controller->target_speed_rpm = 0.0f;
+  controller->current_command = 0;
+  speed_pid_reset(controller);
+  angle_pid_reset(controller);
+
+  if (controller->encoder_initialized)
+  {
+    controller->multi_turn_origin_ecd =
+        encoder_nearest_calibrated_zero(
+            controller,
+            controller->feedback.total_angle_ecd,
+            controller->feedback.angle);
+    controller->multi_turn_origin_valid = true;
+    controller->target_total_angle_ecd =
+        controller->feedback.total_angle_ecd;
+  }
+  else
+  {
+    controller->multi_turn_origin_valid = false;
+  }
+}
+
+bool GM6020_SetZeroOffsetsEcd(uint16_t yaw_zero_ecd,
+                             uint16_t pitch_zero_ecd)
+{
+  const uint16_t zero_ecd[GM6020_AXIS_COUNT] =
+  {
+    yaw_zero_ecd,
+    pitch_zero_ecd
+  };
+  uint32_t axis_index;
+
+  if ((motor_can == NULL)
+      || (yaw_zero_ecd >= GM6020_ENCODER_CPR)
+      || (pitch_zero_ecd >= GM6020_ENCODER_CPR))
+  {
+    return false;
+  }
+
+  /* 已收到反馈时，只允许在两轴在线且静止的条件下更新坐标零点。 */
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    const GM6020_Controller_t *controller =
+        &controllers[axis_index];
+
+    if (!zero_offset_can_be_applied(controller))
+    {
+      return false;
+    }
+  }
+
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    GM6020_Controller_t *controller = &controllers[axis_index];
+
+    apply_zero_offset_ecd(controller, zero_ecd[axis_index]);
+  }
+
+  return true;
+}
+
+bool GM6020_SetAxisZeroOffsetEcd(GM6020_Axis_t axis,
+                                uint16_t zero_ecd)
+{
+  GM6020_Controller_t *controller;
+
+  if ((motor_can == NULL)
+      || !axis_is_valid(axis)
+      || (zero_ecd >= GM6020_ENCODER_CPR))
+  {
+    return false;
+  }
+
+  controller = &controllers[axis];
+  if (!zero_offset_can_be_applied(controller))
+  {
+    return false;
+  }
+
+  apply_zero_offset_ecd(controller, zero_ecd);
+  return true;
 }
 
 /*
@@ -1622,6 +1780,7 @@ void GM6020_Process(void)
         (int16_t)(((uint16_t)rx_data[4] << 8) | rx_data[5]);
     controller->feedback.temperature = rx_data[6];
     controller->feedback.last_rx_ms = now;
+    ++controller->feedback.rx_sequence;
     controller->feedback.online = true;
 
     /*

@@ -1,9 +1,9 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    can.h
+  * @file    dma.h
   * @brief   This file contains all the function prototypes for
-  *          the can.c file
+  *          the dma.c file
   ******************************************************************************
   * @attention
   *
@@ -16,10 +16,21 @@
   *
   ******************************************************************************
   */
+/**
+ * ===========================================================================
+ * @file    dma.h
+ * @brief   DMA 控制器初始化 — MX_DMA_Init() 声明
+ * ===========================================================================
+ *
+ * 【DMA 通道分配】
+ *   DMA1_Stream1 — USART3_RX (DBUS 遥控器接收)
+ *   中断优先级 0（最高），确保 DBUS 帧不丢失
+ * ===========================================================================
+ */
 /* USER CODE END Header */
 /* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __CAN_H__
-#define __CAN_H__
+#ifndef __DMA_H__
+#define __DMA_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,20 +39,17 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
+/* DMA memory to memory transfer handles -------------------------------------*/
+
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
-
-extern CAN_HandleTypeDef hcan1;
-
-extern CAN_HandleTypeDef hcan2;
 
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
-void MX_CAN1_Init(void);
-void MX_CAN2_Init(void);
+void MX_DMA_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
@@ -51,5 +59,5 @@ void MX_CAN2_Init(void);
 }
 #endif
 
-#endif /* __CAN_H__ */
+#endif /* __DMA_H__ */
 

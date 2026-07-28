@@ -48,7 +48,7 @@
 
 /*======================= Yaw 轴 PID 参数 (Yaw Axis PID Parameters) =======================*/
 /* ---- 速度环 (Speed Loop / Inner Loop) ---- */
-#define YAW_SPEED_PID_KP                10.0f    /* 比例增益 — proportional gain */
+#define YAW_SPEED_PID_KP                20.0f    /* 比例增益 — proportional gain */
 #define YAW_SPEED_PID_KI                0.0f     /* 积分增益 — integral gain */
 #define YAW_SPEED_PID_KD                0.0f     /* 微分增益 — derivative gain */
 #define YAW_SPEED_PID_OUTPUT_LIMIT      8192.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
@@ -77,6 +77,7 @@
  * 逻辑角度 0° 对应的电机单圈编码器角度 (Encoder angle at mechanical zero position)。
  * 安装完成后读取中位反馈角度，并填入 YAW_ZERO_OFFSET_DEG。
  * 例：若云台中位时编码器读数为 2048，则设 YAW_ZERO_OFFSET_DEG = 2048 × 360 / 8192 = 90°。
+ * 上电自动标定完成后，运行时会用开机姿态覆盖这里的默认值。
  */
 #define YAW_ZERO_OFFSET_DEG             0.0f     /* 零位偏置 — zero position offset (degrees) */
 
@@ -102,6 +103,13 @@
 #define PITCH_MAX_ANGLE_DEG             30.0f    /* 最大俯仰角度 — 抬头 (look up) */
 
 /*===================== 公共安全参数 (Common Safety Parameters) =====================*/
+/*
+ * Yaw 单轴装机测试模式：
+ *   1 = 只等待/标定/遥控 Yaw，发送 0x1FE 时强制 Pitch 电流槽为 0；
+ *   0 = 恢复 Yaw + Pitch 双轴标定和遥控控制。
+ */
+#define GIMBAL_YAW_ONLY_TEST_MODE       1U
+
 /* 反馈超时阈值：100ms 内未收到有效 CAN 反馈 → FAULT 状态 → 输出零电流 */
 #define GM6020_FEEDBACK_TIMEOUT_MS      100U     /* 反馈超时 — feedback timeout (ms) */
 

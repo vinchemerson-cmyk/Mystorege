@@ -30,6 +30,7 @@
  *         Pitch 范围: ±30° (单圈位置)
  *     "ESTOP\r\n"                  — 锁存式急停（不区分大小写）
  *     "CLEAR\r\n"                  — 解除急停（严格区分大小写）
+ *     "CALSTATUS\r\n"              — 查询上电自动标定状态（可选）
  *
  *   输出（MCU→上位机）:
  *     "OK\r\n"       — 命令执行成功
@@ -37,6 +38,9 @@
  *     "ESTOPPED\r\n" — 已执行急停
  *     "CLEARED\r\n"  — 已解除急停
  *     "LOCKED\r\n"   — 急停锁存中，拒绝角度命令
+ *     "CALIBRATING\r\n" / "CALIBRATED\r\n" / "CALWAIT\r\n"
+ *     / "CALMOVING\r\n" / "CALERROR\r\n"
+ *                    — 零位标定状态
  *     "FB,<yaw_deg>,<pitch_deg>,<yaw_rpm>,<pitch_rpm>,<yaw_online>,<pitch_online>,<estop>\r\n"
  *                    — 周期反馈帧 (~1 Hz)
  *
@@ -50,6 +54,7 @@
 #include "control_input.h"
 
 #include "chassis_can.h"
+#include "gimbal_calibration.h"
 #include "motor_control.h"
 #include "usbd_cdc_if.h"
 
@@ -95,7 +100,12 @@ typedef enum
   CONTROL_ACK_ERR,           /* 命令格式错误 "ERR\r\n" */
   CONTROL_ACK_ESTOPPED,      /* 急停已执行 "ESTOPPED\r\n" */
   CONTROL_ACK_CLEARED,       /* 急停已解除 "CLEARED\r\n" */
-  CONTROL_ACK_LOCKED         /* 急停锁存中，拒绝命令 "LOCKED\r\n" */
+  CONTROL_ACK_LOCKED,        /* 急停锁存中，拒绝命令 "LOCKED\r\n" */
+  CONTROL_ACK_CALIBRATING,   /* 正在采集标定样本 */
+  CONTROL_ACK_CALIBRATED,    /* 上电自动标定已完成 */
+  CONTROL_ACK_CALWAIT,       /* 等待两轴有效反馈 */
+  CONTROL_ACK_CALMOVING,     /* 云台未静止，样本已重置 */
+  CONTROL_ACK_CALERROR       /* 运行时应用零位失败 */
 } ControlAck_t;
 
 /*
@@ -122,6 +132,11 @@ static uint8_t err_reply[]     = "ERR\r\n";      /* 格式错误 */
 static uint8_t estopped_reply[] = "ESTOPPED\r\n"; /* 已急停 */
 static uint8_t cleared_reply[] = "CLEARED\r\n";   /* 已清除 */
 static uint8_t locked_reply[]  = "LOCKED\r\n";    /* 锁存拒绝 */
+static uint8_t calibrating_reply[] = "CALIBRATING\r\n";
+static uint8_t calibrated_reply[] = "CALIBRATED\r\n";
+static uint8_t calibration_wait_reply[] = "CALWAIT\r\n";
+static uint8_t calibration_moving_reply[] = "CALMOVING\r\n";
+static uint8_t calibration_error_reply[] = "CALERROR\r\n";
 
 /* 反馈上报缓冲区与时间戳 */
 static uint8_t feedback_reply[CONTROL_OUT_BUFFER_CAPACITY]; /* 反馈帧格式化缓冲区 */
@@ -350,6 +365,34 @@ static void transmit_pending_ack(void)
     result = CDC_Transmit_FS(
         locked_reply, sizeof(locked_reply) - 1U);
   }
+  else if (pending_ack == CONTROL_ACK_CALIBRATING)
+  {
+    result = CDC_Transmit_FS(
+        calibrating_reply, sizeof(calibrating_reply) - 1U);
+  }
+  else if (pending_ack == CONTROL_ACK_CALIBRATED)
+  {
+    result = CDC_Transmit_FS(
+        calibrated_reply, sizeof(calibrated_reply) - 1U);
+  }
+  else if (pending_ack == CONTROL_ACK_CALWAIT)
+  {
+    result = CDC_Transmit_FS(
+        calibration_wait_reply,
+        sizeof(calibration_wait_reply) - 1U);
+  }
+  else if (pending_ack == CONTROL_ACK_CALMOVING)
+  {
+    result = CDC_Transmit_FS(
+        calibration_moving_reply,
+        sizeof(calibration_moving_reply) - 1U);
+  }
+  else if (pending_ack == CONTROL_ACK_CALERROR)
+  {
+    result = CDC_Transmit_FS(
+        calibration_error_reply,
+        sizeof(calibration_error_reply) - 1U);
+  }
   else
   {
     return;
@@ -419,7 +462,36 @@ void control_in(void)
     return;
   }
 
-  if (!line_invalid && (strcmp(line, "CLEAR") == 0))
+  if (!line_invalid && (strcmp(line, "CALSTATUS") == 0))
+  {
+    switch (GimbalCalibration_GetStatus())
+    {
+      case GIMBAL_CALIBRATION_CALIBRATED:
+        pending_ack = CONTROL_ACK_CALIBRATED;
+        break;
+
+      case GIMBAL_CALIBRATION_WAITING_FEEDBACK:
+        pending_ack = CONTROL_ACK_CALWAIT;
+        break;
+
+      case GIMBAL_CALIBRATION_WAITING_STILL:
+        pending_ack = CONTROL_ACK_CALMOVING;
+        break;
+
+      case GIMBAL_CALIBRATION_SAMPLING:
+        pending_ack = CONTROL_ACK_CALIBRATING;
+        break;
+
+      case GIMBAL_CALIBRATION_ERROR:
+        pending_ack = CONTROL_ACK_CALERROR;
+        break;
+
+      default:
+        pending_ack = CONTROL_ACK_CALERROR;
+        break;
+    }
+  }
+  else if (!line_invalid && (strcmp(line, "CLEAR") == 0))
   {
     GM6020_ClearEmergencyStop();
     ChassisCAN_ClearEmergencyStop();
@@ -429,7 +501,8 @@ void control_in(void)
            && parse_target_pair(
                line, &yaw_angle_deg, &pitch_angle_deg))
   {
-    if (GM6020_IsEmergencyStopped())
+    if (GM6020_IsEmergencyStopped()
+        || GimbalCalibration_IsBusy())
     {
       pending_ack = CONTROL_ACK_LOCKED;
     }
@@ -519,8 +592,8 @@ static void format_angle(char *buffer, size_t capacity,
  *           yaw_online/pitch_online: 电机在线状态 (1=在线, 0=离线)
  *           estop: 急停状态 (1=急停中, 0=正常)
  *
- * 【注意】Yaw 上报的是累计多圈角度（相对于启动位置），
- *         Pitch 上报的是单圈累计角度。
+ * 【注意】Yaw/Pitch 均上报相对于标定机械零点的角度；
+ *         Yaw 保留累计多圈信息。
  */
 void control_out(void)
 {
@@ -528,6 +601,7 @@ void control_out(void)
   const GM6020_Feedback_t *yaw_feedback;
   const GM6020_Feedback_t *pitch_feedback;
   float yaw_multi_turn_deg;
+  float pitch_position_deg;
   char yaw_angle[20];
   char pitch_angle[20];
   int length;
@@ -551,11 +625,16 @@ void control_out(void)
   {
     yaw_multi_turn_deg = 0.0f;
   }
+  if (!GM6020_GetMultiTurnPosition(
+          GM6020_AXIS_PITCH, &pitch_position_deg))
+  {
+    pitch_position_deg = 0.0f;
+  }
 
   format_angle(yaw_angle, sizeof(yaw_angle),
                yaw_multi_turn_deg);
   format_angle(pitch_angle, sizeof(pitch_angle),
-               pitch_feedback->total_angle_deg);
+               pitch_position_deg);
 
   length = snprintf(
       (char *)feedback_reply,

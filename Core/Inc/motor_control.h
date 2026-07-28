@@ -50,6 +50,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#define GM6020_ENCODER_CPR 8192U
+
 /*
  * 轴枚举 (Axis Enumeration)。
  *
@@ -93,6 +95,7 @@ typedef struct
   int16_t torque_current;   /* 转矩电流原始值 — torque current raw value (±16384 ≈ ±3A per GM6020 datasheet) */
   uint8_t temperature;      /* 电机内部温度 — internal temperature sensor reading (℃) */
   uint32_t last_rx_ms;      /* 最近有效反馈时间戳 — last valid CAN feedback timestamp (HAL_GetTick) */
+  uint32_t rx_sequence;     /* 有效反馈帧序号 — increments once for every newly decoded CAN frame */
   bool online;              /* 在线状态 — true: 距上次反馈未超过超时阈值 */
 } GM6020_Feedback_t;
 
@@ -145,6 +148,24 @@ void GM6020_ClearEmergencyStop(void);
 bool GM6020_IsEmergencyStopped(void);
 
 /*
+ * 应用两轴编码器机械零位。
+ *
+ * yaw_zero_ecd/pitch_zero_ecd 为云台处在逻辑 0° 时对应的 GM6020
+ * 单圈编码器值。只能在主循环中、两轴静止时调用；函数会把位置
+ * 目标同步到当前反馈，更新零点时不会产生位置跳变。
+ */
+bool GM6020_SetZeroOffsetsEcd(uint16_t yaw_zero_ecd,
+                             uint16_t pitch_zero_ecd);
+
+/*
+ * 仅设置指定轴的编码器机械零位。
+ *
+ * 用于单轴装机测试；只检查并更新所选轴，不要求另一轴在线。
+ */
+bool GM6020_SetAxisZeroOffsetEcd(GM6020_Axis_t axis,
+                                uint16_t zero_ecd);
+
+/*
  * 设置单轴位置目标。
  *
  * target_angle_deg 为相对配置零位的逻辑角度（度）。
@@ -163,7 +184,7 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
 /*
  * 设置累计多圈位置目标。
  *
- * target_angle_deg 相对于距离本次启动位置最近的编码器原始零点：
+ * target_angle_deg 相对于标定后的机械零点：
  *   360°  = 正向 1 圈
  *   1080° = 正向 3 圈
  *   -720° = 反向 2 圈
@@ -259,7 +280,7 @@ void GM6020_Process(void);
 const GM6020_Feedback_t *GM6020_GetFeedback(GM6020_Axis_t axis);
 
 /*
- * 获取相对于编码器原始零点的累计多圈角度。
+ * 获取相对于标定机械零点的累计多圈角度。
  * 编码器尚未初始化或参数无效时返回 false。
  */
 bool GM6020_GetMultiTurnPosition(

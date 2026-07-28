@@ -35,9 +35,9 @@ void control_in_receive(const uint8_t *data, uint32_t length);
 
 /*
  * 双轴串口控制入口 (Dual-Axis Serial Control Entry)。
- * 在主循环中调用，解析 "yaw,pitch\r\n"、"ESTOP\r\n"
- * 和 "CLEAR\r\n"。
- * Yaw 为相对编码器零点的累计多圈角度 (accumulated multi-turn angle)，
+ * 在主循环中调用，解析 "yaw,pitch\r\n"、"ESTOP\r\n"、
+ * "CLEAR\r\n" 和可选诊断命令 "CALSTATUS\r\n"。
+ * Yaw 为相对标定机械零点的累计多圈角度 (accumulated multi-turn angle)，
  * Pitch 为单圈位置目标 (single-turn position target)。
  */
 void control_in(void);
