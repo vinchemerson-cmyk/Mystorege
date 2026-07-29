@@ -11,18 +11,17 @@
  * ============================================================================
  *
  * 【硬件拓扑】
- *   两个 DJI GM6020 无刷直流电机挂在同一条 CAN 总线上：
- *     Yaw   电机 ID=1 → 反馈帧 0x205，电流命令位于 0x1FE 的 DATA[0:1]
- *     Pitch 电机 ID=2 → 反馈帧 0x206，电流命令位于 0x1FE 的 DATA[2:3]
+ *   两个 DJI GM6020 分别连接到两条 CAN 总线，且电机 ID 都为 2：
+ *     Yaw   → 上板 CAN1（经滑环到下板 CAN2），反馈帧 0x206
+ *     Pitch → 上板 CAN2，反馈帧 0x206
  *
  * 【控制算法】
  *   串级 PID：外环角度环（P/PD）→ 内环速度环（PI/PD）
  *   每个轴拥有独立的编码器多圈累计、状态机和两套 PID 控制器。
  *
  * 【CAN 协议约束】
- *   GM6020 的电流命令帧 0x1FE 必须同时包含两个电机的电流值，
- *   不能分别发送只带单个轴电流、另一轴置零的帧，否则另一方会失控。
- *   因此所有电流输出统一由 gm6020_send_group_current() 打包发送。
+ *   两台电机物理总线不同，因此每条总线分别发送一帧 0x1FE。
+ *   该总线只有一台 ID 2 电机，DATA[2:3] 放本轴电流，其余槽位置零。
  *
  * 【控制时序】
  *   GM6020_Process() 在主循环中高频调用，每轮耗尽 CAN RX FIFO 中
@@ -150,13 +149,15 @@ typedef struct
 
 /*
  * 每个轴的 CAN 总线配置。
- * feedback_std_id: 电机反馈帧的标准 ID（Yaw=0x205, Pitch=0x206）
+ * feedback_std_id: 电机反馈帧的标准 ID（两轴都是 0x206）
  * current_slot: 在 0x1FE 电流命令帧中的槽位编号（0=DATA[0:1], 1=DATA[2:3]）
+ * filter_bank: bxCAN 共享过滤器组编号（CAN1 用 0，CAN2 用 14）
  */
 typedef struct
 {
   uint16_t feedback_std_id;
   uint8_t current_slot;
+  uint8_t filter_bank;
 } GM6020_AxisCanConfig_t;
 
 /*
@@ -168,11 +169,13 @@ static const GM6020_AxisCanConfig_t axis_can_config[
 {
   {
     YAW_FEEDBACK_STD_ID,
-    YAW_CURRENT_COMMAND_SLOT
+    YAW_CURRENT_COMMAND_SLOT,
+    YAW_CAN_FILTER_BANK
   },
   {
     PITCH_FEEDBACK_STD_ID,
-    PITCH_CURRENT_COMMAND_SLOT
+    PITCH_CURRENT_COMMAND_SLOT,
+    PITCH_CAN_FILTER_BANK
   }
 };
 
@@ -252,7 +255,7 @@ static const GM6020_AxisMechanicalConfig_t axis_mechanical_config[
 
 /* ---- 模块级全局变量 ---- */
 
-static CAN_HandleTypeDef *motor_can;                     /* CAN1 句柄指针 */
+static CAN_HandleTypeDef *motor_can[GM6020_AXIS_COUNT];  /* 每轴独立 CAN 句柄 */
 static GM6020_Controller_t controllers[GM6020_AXIS_COUNT]; /* 两轴控制器实例 */
 static bool emergency_stop_latched;                     /* 串口锁存急停 */
 
@@ -267,6 +270,12 @@ static bool emergency_stop_latched;                     /* 串口锁存急停 */
 static bool axis_is_valid(GM6020_Axis_t axis)
 {
   return ((uint32_t)axis < (uint32_t)GM6020_AXIS_COUNT);
+}
+
+static bool motor_can_is_initialized(void)
+{
+  return ((motor_can[GM6020_AXIS_YAW] != NULL)
+          && (motor_can[GM6020_AXIS_PITCH] != NULL));
 }
 
 /*
@@ -303,6 +312,7 @@ static bool axis_configuration_is_valid(GM6020_Axis_t axis)
 
   if ((can_config->feedback_std_id > 0x7FFU)
       || (can_config->current_slot > 3U)
+      || (can_config->filter_bank > 27U)
       || !(pid_config->speed_output_limit > 0.0f)
       || !(pid_config->angle_speed_limit_rpm > 0.0f)
       || !isfinite(mechanical->zero_offset_deg))
@@ -356,7 +366,9 @@ static void angle_pid_reset(GM6020_Controller_t *controller)
  * 例：-90° → 270°，450° → 90°。
  */
 static float normalize_single_turn_degrees(float angle_deg)
+/* ── 浮点角度归一化到 [0, 360°) ── */
 {
+  /* Normalize to single-turn range: subtract multiples of 360 */
   while (angle_deg >= 360.0f)
   {
     angle_deg -= 360.0f;
@@ -372,11 +384,14 @@ static float normalize_single_turn_degrees(float angle_deg)
  * 将单圈角度（度）转换为编码器计数值。
  * 输入 0~360°，输出 0~8191，四舍五入取整。
  */
+/* Convert degrees [0,360) → encoder counts [0,8191] with rounding */
 static int32_t single_turn_degrees_to_encoder(float angle_deg)
 {
   int32_t encoder;
+  /* angle_deg × (8192/360) + 0.5 for round-to-nearest */
 
   angle_deg = normalize_single_turn_degrees(angle_deg);
+  /* Edge case: rounding up to exactly 8192 → wrap to 0 */
   encoder = (int32_t)(angle_deg * (float)GM6020_ENCODER_CPR
                       / 360.0f + 0.5f);
   if (encoder >= GM6020_ENCODER_CPR)
@@ -404,8 +419,10 @@ static int32_t single_turn_degrees_to_encoder(float angle_deg)
  *   多圈目标消除了这种歧义，电机始终沿最短路径转动。
  */
 static void angle_resolve_single_turn_target(
+  /* ── 步骤1: 目标角度 → 编码器值 ── */
     GM6020_Controller_t *controller,
     float angle_deg)
+  /* ── 步骤2: 劣弧方向最短路径选择 ── */
 {
   int32_t desired_encoder;
   int32_t delta;
@@ -433,8 +450,10 @@ static void angle_resolve_single_turn_target(
   }
   else if (delta < -GM6020_ENCODER_HALF_CPR)
   {
+  /* ── 步骤3: 叠加到当前多圈累计值 → 多圈目标 ── */
     delta += GM6020_ENCODER_CPR;
   }
+  /* Target change → reset angle PID to avoid integral windup from old target */
 
   /* 叠加到当前多圈累计值，得到最终多圈目标 */
   controller->target_total_angle_ecd =
@@ -484,6 +503,16 @@ static void angle_resolve_multi_turn_target(
 /*
  * 返回与当前累计位置距离最近的“标定机械零点”累计编码器值。
  * zero_offset_deg 表示逻辑 0° 对应的单圈编码器位置。
+ */
+/*
+ * 计算距离标定零位最近的编码器多圈原点。
+ *
+ * 标定后 zero_offset_deg 存的是云台中位对应的编码器单圈角度，
+ * 此函数以当前多圈位置为基准，找到距离该标定零位最近的
+ * 编码器多圈原点 (multi-turn origin ECD)，使 multi_turn_origin_ecd
+ * 在物理上最接近标定后的机械零位。
+ *
+ * @return 距离标定零位最近的多圈编码器原点值
  */
 static int32_t encoder_nearest_calibrated_zero(
     const GM6020_Controller_t *controller,
@@ -608,41 +637,45 @@ static void encoder_update(GM6020_Controller_t *controller,
 static float angle_pid_update(GM6020_Controller_t *controller)
 {
   AnglePID_t *pid = &controller->angle_pid;
-  const float output_limit = controller->angle_speed_limit_rpm;
+  const float output_limit = controller->angle_speed_limit_rpm;  /* 角度环输出限幅 rpm — angle loop output clamp */
 
   /*
-   * 误差 = 目标 - 当前，单位为编码器计数，乘以转换因子得到角度误差（度）。
-   * 正误差 = 需要正向转动才能追上目标。
+   * ── 步骤1: 计算角度误差 (Position Error) ──
+   * 误差 = 目标多圈ecd - 当前多圈ecd，转换为度。
+   * error > 0 → 需要正向转动才能追上目标
+   * error < 0 → 需要反向转动
    */
   const float error =
       (float)(controller->target_total_angle_ecd
               - controller->feedback.total_angle_ecd)
-      * 360.0f / (float)GM6020_ENCODER_CPR;
+      * 360.0f / (float)GM6020_ENCODER_CPR;   /* ecd counts → degrees: ×360/8192 */
 
-  /* 微分项：误差变化率 / 控制周期（不直接用编码器反馈避免噪声放大） */
+  /* ── 步骤2: 计算微分项 (Derivative Term) ── */
+  /* D_term = d(error)/dt ≈ Δerror / Δt, Δt = 1/1000 s = 0.001 s */
   const float derivative =
-      (error - pid->previous_error) / GM6020_CONTROL_PERIOD_S;
+      (error - pid->previous_error) / GM6020_CONTROL_PERIOD_S;  /* Δerror / 0.001s */
 
-  /* 比例 + 微分（不含积分，用于 anti-windup 判断） */
+  /* ── 步骤3: 计算 P+D 项 (用于 anti-windup 判断) ── */
   const float proportional_and_derivative =
-      pid->kp * error + pid->kd * derivative;
+      pid->kp * error + pid->kd * derivative;  /* P_term + D_term */
 
-  /* 积分候选值：当前积分 + 本拍增量，先限幅防止积分绝对值过大 */
+  /* ── 步骤4: 计算积分候选值 (Integral Candidate) ── */
+  /* I_candidate = old_I + Ki × error × Δt, 预先限幅到 ±output_limit 防止绝对值过大 */
   const float candidate_integral = clamp_float(
-      pid->integral + pid->ki * error * GM6020_CONTROL_PERIOD_S,
+      pid->integral + pid->ki * error * GM6020_CONTROL_PERIOD_S,  /* I += Ki × error × 0.001 */
       -output_limit,
       output_limit);
 
-  /* 完整的候选输出 */
+  /* ── 步骤5: 计算完整候选输出 (Candidate Output) ── */
   const float candidate_output =
-      proportional_and_derivative + candidate_integral;
+      proportional_and_derivative + candidate_integral;  /* output = P + D + I_candidate */
 
+  /* ── 步骤6: Anti-windup 积分更新决策 ── */
   /*
-   * Anti-windup 条件判断：
-   *   条件1：候选输出在限幅范围内 → 正常更新积分
-   *   条件2：输出已达上限但误差 < 0 → 正在往回拉，可以更新积分（退饱和）
-   *   条件3：输出已达下限但误差 > 0 → 正在往回拉，可以更新积分（退饱和）
-   *   以上任一满足，则接受新的积分值；否则保持旧积分值不变
+   * 条件A: candidate_output 在 (-limit, +limit) 内 → PID 未饱和 → 正常更新积分
+   * 条件B: output ≥ +limit 且 error < 0 → 已达到正向饱和但误差已反向 → 退饱和 → 更新积分
+   * 条件C: output ≤ -limit 且 error > 0 → 已达到负向饱和但误差已反向 → 退饱和 → 更新积分
+   * 否则: 输出饱和且误差方向仍驱使继续饱和 → 冻结积分 (积分抗饱和/积分分离)
    */
   if (((candidate_output < output_limit)
        && (candidate_output > -output_limit))
@@ -651,18 +684,19 @@ static float angle_pid_update(GM6020_Controller_t *controller)
       || ((candidate_output <= -output_limit)
           && (error > 0.0f)))
   {
-    pid->integral = candidate_integral;
+    pid->integral = candidate_integral;  /* 接受新的积分值 — accept new integral */
   }
+  /* else: 积分保持旧值不变 — integral frozen (anti-windup active) */
 
-  /* 最终输出 = P + D + I（可能是旧的积分值），再限幅一次确保安全 */
-  pid->output = proportional_and_derivative + pid->integral;
+  /* ── 步骤7: 计算最终输出并限幅 ── */
+  pid->output = proportional_and_derivative + pid->integral;  /* P + D + I (maybe old I) */
   pid->output = clamp_float(pid->output,
                             -output_limit,
-                            output_limit);
+                            output_limit);  /* 硬限幅: output ∈ [−limit, +limit] */
 
-  /* 保存本拍误差供下一拍微分计算 */
-  pid->previous_error = error;
-  return pid->output;
+  /* ── 步骤8: 保存本拍误差供下一拍微分 ── */
+  pid->previous_error = error;  /* prev_error ← current_error for next derivative calc */
+  return pid->output;           /* 返回目标转速 rpm → speed_pid_update() 的目标输入 */
 }
 
 /*
@@ -680,27 +714,32 @@ static float speed_pid_update(GM6020_Controller_t *controller,
                               float feedback)
 {
   SpeedPID_t *pid = &controller->speed_pid;
-  const float output_limit = controller->speed_output_limit;
+  const float output_limit = controller->speed_output_limit;  /* 电流输出限幅 — current output clamp (±8192) */
 
-  /* 误差 = 目标转速 - 实际转速 */
-  const float error = target - feedback;
+  /* ── 步骤1: 速度误差 (Speed Error) ── */
+  /* error > 0 → 实际转速低于目标 → 需要增加正向电流驱动 */
+  const float error = target - feedback;  /* target_rpm - actual_rpm */
 
-  /* 微分项：误差变化率 */
+  /* ── 步骤2: 微分项 = Δerror / Δt ── */
   const float derivative =
       (error - pid->previous_error) / GM6020_CONTROL_PERIOD_S;
 
+  /* ── 步骤3: P+D 项 ── */
   const float proportional_and_derivative =
       pid->kp * error + pid->kd * derivative;
 
+  /* ── 步骤4: 积分候选值 (先限幅) ── */
   const float candidate_integral = clamp_float(
-      pid->integral + pid->ki * error * GM6020_CONTROL_PERIOD_S,
+      pid->integral + pid->ki * error * GM6020_CONTROL_PERIOD_S,  /* I += Ki×error×Δt */
       -output_limit,
       output_limit);
 
+  /* ── 步骤5: 完整候选输出 ── */
   const float candidate_output =
       proportional_and_derivative + candidate_integral;
 
-  /* Anti-windup：仅在输出未饱和或误差方向有利于退饱和时更新积分 */
+  /* ── 步骤6: Anti-windup ── */
+  /* 与 angle_pid_update 相同的 anti-windup 逻辑（参见其详细注释） */
   if (((candidate_output < output_limit)
        && (candidate_output > -output_limit))
       || ((candidate_output >= output_limit)
@@ -711,12 +750,15 @@ static float speed_pid_update(GM6020_Controller_t *controller,
     pid->integral = candidate_integral;
   }
 
+  /* ── 步骤7: 最终输出 + 硬限幅 ── */
   pid->output = proportional_and_derivative + pid->integral;
   pid->output = clamp_float(pid->output,
                             -output_limit,
-                            output_limit);
+                            output_limit);  /* 最终电流值限幅到 ±8192 */
+
+  /* ── 步骤8: 保存误差 ── */
   pid->previous_error = error;
-  return pid->output;
+  return pid->output;  /* 返回 float 电流值 → 调用方截断为 int16_t */
 }
 
 /*====================================================================
@@ -724,26 +766,35 @@ static float speed_pid_update(GM6020_Controller_t *controller,
  *====================================================================*/
 
 /*
- * 发送合并电流命令帧 0x1FE。
+ * 在指定轴的 CAN 总线上发送电流命令帧 0x1FE。
  *
  * 【帧格式】
  *   StdId = 0x1FE, DLC = 8, 数据帧
- *   DATA[0:1] = Yaw 电流   (大端，slot 0)
- *   DATA[2:3] = Pitch 电流 (大端，slot 1)
- *   DATA[4:7] = 0（保留）
- *
- * 【重要】
- *   0x1FE 必须一次性包含两个轴的最新电流值。
- *   若分别发送含零值的帧会导致另一轴失控。
+ *   DATA[2:3] = 当前轴 ID 2 电流（大端，slot 1）
+ *   其他字节 = 0
  *
  * 【返回值】HAL_CAN_AddTxMessage 的状态。
  */
-static HAL_StatusTypeDef gm6020_send_group_current(void)
+static HAL_StatusTypeDef gm6020_send_axis_current(GM6020_Axis_t axis)
+/*
+ * 发送单轴转矩电流命令到 0x1FE 帧。
+ * 每个轴可能挂在不同的 CAN 总线上 (motor_can[axis])，
+ * 因此需要按轴独立发送。电流值按 Big-Endian int16 打包
+ * 到对应电流槽位 (slot 0 → offset 0, slot 1 → offset 2)。
+ */
 {
   CAN_TxHeaderTypeDef tx_header = {0};
   uint8_t tx_data[8] = {0};
   uint32_t mailbox;
-  uint32_t axis_index;
+  int16_t current_command;
+  uint16_t raw;
+  uint32_t offset;
+
+  if (!axis_is_valid(axis) || (motor_can[axis] == NULL))
+  {
+    return HAL_ERROR;
+  }
+  /* Construct CAN header: StdId=0x1FE, 8-byte data frame */
 
   tx_header.StdId = GM6020_CURRENT_COMMAND_ID;
   tx_header.IDE = CAN_ID_STD;
@@ -751,38 +802,45 @@ static HAL_StatusTypeDef gm6020_send_group_current(void)
   tx_header.DLC = 8U;
   tx_header.TransmitGlobalTime = DISABLE;
 
-  /*
-   * 遍历两轴，将各自的 current_command 填入 tx_data 的正确偏移位置。
-   * current_slot 决定偏移量：slot 0 → offset 0 (DATA[0:1])
-   *                         slot 1 → offset 2 (DATA[2:3])
-   */
+  current_command = controllers[axis].current_command;
+
+  /* Pack int16 current as Big-Endian into the correct slot offset */
+#if GIMBAL_YAW_ONLY_TEST_MODE
+  if (axis == GM6020_AXIS_PITCH)
+  {
+    current_command = 0;
+  }
+  /* Submit frame to the CAN TX mailbox of this axis's bus */
+#endif
+
+  raw = (uint16_t)current_command;
+  offset = (uint32_t)axis_can_config[axis].current_slot * 2U;
+  tx_data[offset] = (uint8_t)(raw >> 8);
+  tx_data[offset + 1U] = (uint8_t)raw;
+
+  return HAL_CAN_AddTxMessage(
+      motor_can[axis], &tx_header, tx_data, &mailbox);
+}
+
+static HAL_StatusTypeDef gm6020_send_all_currents(void)
+{
+  HAL_StatusTypeDef result = HAL_OK;
+/* Send current for ALL axes on their respective CAN buses. Best-effort: first error is reported. */
+  uint32_t axis_index;
+
   for (axis_index = 0U;
        axis_index < (uint32_t)GM6020_AXIS_COUNT;
        ++axis_index)
   {
-    int16_t current_command =
-        controllers[axis_index].current_command;
-
-#if GIMBAL_YAW_ONLY_TEST_MODE
-    /*
-     * 单轴测试期间，即使 Pitch 意外收到反馈并运行了内部状态机，
-     * 发到 0x1FE 的 Pitch 电流槽也始终保持为 0。
-     */
-    if (axis_index == (uint32_t)GM6020_AXIS_PITCH)
+    HAL_StatusTypeDef status = gm6020_send_axis_current(
+        (GM6020_Axis_t)axis_index);
+    if ((status != HAL_OK) && (result == HAL_OK))
     {
-      current_command = 0;
+      result = status;
     }
-#endif
-
-    const uint16_t raw = (uint16_t)current_command;
-    const uint32_t offset =
-        (uint32_t)axis_can_config[axis_index].current_slot * 2U;
-    tx_data[offset] = (uint8_t)(raw >> 8);       /* 大端高字节 */
-    tx_data[offset + 1U] = (uint8_t)raw;          /* 大端低字节 */
   }
 
-  return HAL_CAN_AddTxMessage(
-      motor_can, &tx_header, tx_data, &mailbox);
+  return result;
 }
 
 /*====================================================================
@@ -804,6 +862,8 @@ typedef void (*ControlStateFeedbackHandler_t)(
  */
 static void state_zero_current_on_feedback(
     GM6020_Controller_t *controller)
+/* WAIT_FEEDBACK / FAULT: 保持零电流输出，等待状态机自动转移到下一状态 */
+/* Keep zero current; state transition handled by control_state_handle_feedback() */
 {
   controller->current_command = 0;
 }
@@ -814,6 +874,8 @@ static void state_zero_current_on_feedback(
  *   2. 速度环 PID：速度误差 → 转矩电流命令
  */
 static void state_position_control_on_feedback(
+/* POSITION_CONTROL: 外环角度PID → 目标转速 → 内环速度PID → 电流命令 */
+/* Outer loop (angle) → target rpm → inner loop (speed) → torque current */
     GM6020_Controller_t *controller)
 {
   /* 外环：位置 → 目标转速 */
@@ -832,6 +894,8 @@ static void state_position_control_on_feedback(
  *   用于整定速度环 PID 参数或测试电机响应。
  */
 static void state_speed_debug_on_feedback(
+/* SPEED_DEBUG: 绕过角度环，直接以人工设定的RPM驱动速度环 */
+/* Bypass angle loop; drive speed loop directly with debug_target_speed_rpm */
     GM6020_Controller_t *controller)
 {
   controller->target_speed_rpm =
@@ -839,6 +903,7 @@ static void state_speed_debug_on_feedback(
   controller->current_command = (int16_t)speed_pid_update(
       controller,
       controller->target_speed_rpm,
+/* 状态→反馈处理函数映射表，索引与 GM6020_ControlState_t 枚举对齐 */
       (float)controller->feedback.speed_rpm);
 }
 
@@ -867,10 +932,13 @@ static const ControlStateFeedbackHandler_t state_handlers[
  *      - POSITION_CONTROL: 有位置目标则解析，否则锁定当前位置
  *      - SPEED_DEBUG: 应用人工设定的目标转速
  *      - FAULT: 标记离线，清除编码器初始化标志，等待下次有效反馈
+  /* ── 执行状态转移 ── */
  */
+  /* Transition to new state: reset current, reset PIDs, init state-specific variables */
 static void control_state_transition(
     GM6020_Controller_t *controller,
     GM6020_ControlState_t next_state)
+    case GM6020_STATE_WAIT_FEEDBACK:  /* ── 上电/复位：等待电机首帧反馈 ── */
 {
   controller->state = next_state;
   controller->current_command = 0;
@@ -1068,28 +1136,31 @@ static void controller_initialize(
  * 配置 CAN 硬件滤波器。
  *
  * 【模式】ID 掩码模式（CAN_FILTERMODE_IDMASK），32 位尺度。
- *   每个滤波器只接收一个特定的标准 ID 反馈帧。
- *   两个滤波器分别对应 Yaw (0x205) 和 Pitch (0x206)，
- *   均路由到 FIFO0。
+ *   CAN1 过滤器组 0 接收 Yaw 0x206，CAN2 过滤器组 14 接收 Pitch 0x206，
+ *   两者均路由到各自的 FIFO0。
  *
- * 【参数】
- *   filter_bank:   滤波器组编号（0 = Yaw, 1 = Pitch）
- *   feedback_std_id: 要接收的标准 ID
+ * 【参数】轴枚举决定 CAN 句柄、过滤器组和反馈 ID。
  */
-static HAL_StatusTypeDef configure_feedback_filter(
-    uint32_t filter_bank,
-    uint16_t feedback_std_id)
+static HAL_StatusTypeDef configure_feedback_filter(GM6020_Axis_t axis)
 {
   CAN_FilterTypeDef filter = {0};
+  const GM6020_AxisCanConfig_t *config;
 
-  filter.FilterBank = filter_bank;
+  if (!axis_is_valid(axis) || (motor_can[axis] == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  config = &axis_can_config[axis];
+
+  filter.FilterBank = config->filter_bank;
   filter.FilterMode = CAN_FILTERMODE_IDMASK;
   filter.FilterScale = CAN_FILTERSCALE_32BIT;
   /*
    * 标准 ID 左移 5 位存入 FilterIdHigh（CAN 规范中标准 ID 在 32 位
    * 寄存器中的位偏移为 21，对应高 16 位的 [15:5]）。
    */
-  filter.FilterIdHigh = (uint16_t)(feedback_std_id << 5);
+  filter.FilterIdHigh = (uint16_t)(config->feedback_std_id << 5);
   filter.FilterIdLow = 0U;
   /* 掩码匹配所有 11 位标准 ID */
   filter.FilterMaskIdHigh = (uint16_t)(0x7FFU << 5);
@@ -1098,7 +1169,22 @@ static HAL_StatusTypeDef configure_feedback_filter(
   filter.FilterActivation = ENABLE;
   filter.SlaveStartFilterBank = 14U;
 
-  return HAL_CAN_ConfigFilter(motor_can, &filter);
+  return HAL_CAN_ConfigFilter(motor_can[axis], &filter);
+}
+
+static HAL_StatusTypeDef start_can_if_needed(CAN_HandleTypeDef *hcan)
+{
+  if (hcan == NULL)
+  {
+    return HAL_ERROR;
+  }
+
+  if (hcan->State == HAL_CAN_STATE_READY)
+  {
+    return HAL_CAN_Start(hcan);
+  }
+
+  return (hcan->State == HAL_CAN_STATE_LISTENING) ? HAL_OK : HAL_ERROR;
 }
 
 /*====================================================================
@@ -1109,38 +1195,32 @@ static HAL_StatusTypeDef configure_feedback_filter(
  * 初始化两轴 GM6020 电机控制器。
  *
  * 【执行流程】
- *   1. 校验 CAN 句柄非空、两轴 CAN ID 和电流槽位不冲突
- *   2. 遍历两轴：校验配置、初始化控制器、配置 CAN 滤波器
- *   3. 启动 CAN 外设
- *   4. 发送初始零电流命令（0x1FE 帧，两轴电流均为 0）
+ *   1. 校验 Yaw=CAN1、Pitch=CAN2 的句柄映射
+ *   2. 遍历两轴：校验配置、初始化控制器、配置独立 CAN 滤波器
+ *   3. 启动 CAN1 和 CAN2
+ *   4. 在两条总线上分别发送初始 0x1FE 零电流命令
  *
  * 【参数】
- *   hcan: CAN1 外设句柄指针
+ *   yaw_can: CAN1 外设句柄；pitch_can: CAN2 外设句柄
  * 【返回值】HAL_OK 表示初始化成功。
  */
-HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan)
+HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *yaw_can,
+                              CAN_HandleTypeDef *pitch_can)
 {
   HAL_StatusTypeDef status;
   uint32_t axis_index;
 
-  if (hcan == NULL)
+  if ((yaw_can == NULL)
+      || (pitch_can == NULL)
+      || (yaw_can == pitch_can)
+      || (yaw_can->Instance != CAN1)
+      || (pitch_can->Instance != CAN2))
   {
     return HAL_ERROR;
   }
 
-  /*
-   * 两轴的反馈 ID 和电流槽位必须不同，否则帧分发会出错。
-   * 如果配置表中有冲突，编译阶段不会报错，运行时在此处拦截。
-   */
-  if ((axis_can_config[GM6020_AXIS_YAW].feedback_std_id
-       == axis_can_config[GM6020_AXIS_PITCH].feedback_std_id)
-      || (axis_can_config[GM6020_AXIS_YAW].current_slot
-          == axis_can_config[GM6020_AXIS_PITCH].current_slot))
-  {
-    return HAL_ERROR;
-  }
-
-  motor_can = hcan;
+  motor_can[GM6020_AXIS_YAW] = yaw_can;
+  motor_can[GM6020_AXIS_PITCH] = pitch_can;
   emergency_stop_latched = false;
 
   for (axis_index = 0U;
@@ -1156,19 +1236,22 @@ HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan)
     controller_initialize(
         &controllers[axis_index], (GM6020_Axis_t)axis_index);
 
-    status = configure_feedback_filter(
-        axis_index,
-        axis_can_config[axis_index].feedback_std_id);
+    status = configure_feedback_filter((GM6020_Axis_t)axis_index);
     if (status != HAL_OK)
     {
       return status;
     }
   }
 
-  status = HAL_CAN_Start(motor_can);
-  if (status != HAL_OK)
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
   {
-    return status;
+    status = start_can_if_needed(motor_can[axis_index]);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
   }
 
   /*
@@ -1176,7 +1259,7 @@ HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan)
    * GM6020 在收到第一个非零 0x1FE 帧之前不会发送反馈，
    * 但发送电流为零的帧是安全的（告知电机初始状态）。
    */
-  return gm6020_send_group_current();
+  return gm6020_send_all_currents();
 }
 
 HAL_StatusTypeDef GM6020_EmergencyStop(void)
@@ -1200,12 +1283,12 @@ HAL_StatusTypeDef GM6020_EmergencyStop(void)
     angle_pid_reset(controller);
   }
 
-  if (motor_can == NULL)
+  if (!motor_can_is_initialized())
   {
     return HAL_ERROR;
   }
 
-  return gm6020_send_group_current();
+  return gm6020_send_all_currents();
 }
 
 void GM6020_ClearEmergencyStop(void)
@@ -1300,7 +1383,7 @@ bool GM6020_SetZeroOffsetsEcd(uint16_t yaw_zero_ecd,
   };
   uint32_t axis_index;
 
-  if ((motor_can == NULL)
+  if (!motor_can_is_initialized()
       || (yaw_zero_ecd >= GM6020_ENCODER_CPR)
       || (pitch_zero_ecd >= GM6020_ENCODER_CPR))
   {
@@ -1338,8 +1421,8 @@ bool GM6020_SetAxisZeroOffsetEcd(GM6020_Axis_t axis,
 {
   GM6020_Controller_t *controller;
 
-  if ((motor_can == NULL)
-      || !axis_is_valid(axis)
+  if (!axis_is_valid(axis)
+      || (motor_can[axis] == NULL)
       || (zero_ecd >= GM6020_ENCODER_CPR))
   {
     return false;
@@ -1695,8 +1778,8 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
  *
  * 【执行流程】
  *   阶段1 — 接收并分发：
- *     循环读取 CAN RX FIFO0 中所有待处理的反馈帧，
- *     根据 StdId 匹配到对应的轴，更新该轴的反馈数据、
+ *     分别读取 CAN1/Yaw 与 CAN2/Pitch 的 RX FIFO0，
+ *     根据物理总线确定轴并校验反馈 StdId，更新该轴反馈数据、
  *     编码器多圈累计，然后调用状态机处理（PID 计算 + 更新电流命令）。
  *
  *   阶段2 — 超时检测：
@@ -1704,8 +1787,7 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
  *     超时则转入 FAULT 状态（输出零电流）。
  *
  *   阶段3 — 发送命令：
- *     如果阶段1或阶段2中有任何电流命令发生变化，
- *     将两轴的最新电流值打包为 0x1FE 帧通过 CAN 发送。
+ *     如果某轴电流命令发生变化，只在该轴对应总线上发送 0x1FE。
  *
  * 【并发说明】
  *   本函数在裸机主循环中运行（非中断上下文），不持有锁。
@@ -1718,7 +1800,12 @@ void GM6020_Process(void)
   uint8_t rx_data[8];
   uint32_t now = HAL_GetTick();
   uint32_t axis_index;
-  bool command_changed = false;
+  bool command_changed[GM6020_AXIS_COUNT] = {false, false};
+
+  if (!motor_can_is_initialized())
+  {
+    return;
+  }
 
   /*
    * --- 阶段1：接收反馈帧并分发到对应轴 ---
@@ -1727,106 +1814,103 @@ void GM6020_Process(void)
    * 一次 Process() 调用可能处理 0 帧（无新反馈）、1 帧（单轴反馈到达）
    * 或多帧（两轴反馈都到达或之前有积压）。
    */
-  while (HAL_CAN_GetRxFifoFillLevel(motor_can, CAN_RX_FIFO0) > 0U)
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
   {
-    GM6020_Controller_t *controller = NULL;
+    CAN_HandleTypeDef *axis_can = motor_can[axis_index];
+    GM6020_Controller_t *controller = &controllers[axis_index];
 
-    if (HAL_CAN_GetRxMessage(motor_can, CAN_RX_FIFO0,
-                            &rx_header, rx_data) != HAL_OK)
+    while (HAL_CAN_GetRxFifoFillLevel(axis_can, CAN_RX_FIFO0) > 0U)
     {
-      break;
-    }
-
-    /* 过滤非标准数据帧（扩展帧、远程帧、DLC≠8 均丢弃） */
-    if ((rx_header.IDE != CAN_ID_STD)
-        || (rx_header.RTR != CAN_RTR_DATA)
-        || (rx_header.DLC != 8U))
-    {
-      continue;
-    }
-
-    /* 根据 StdId 匹配到对应的轴 */
-    for (axis_index = 0U;
-         axis_index < (uint32_t)GM6020_AXIS_COUNT;
-         ++axis_index)
-    {
-      if (rx_header.StdId
-          == axis_can_config[axis_index].feedback_std_id)
+      if (HAL_CAN_GetRxMessage(axis_can, CAN_RX_FIFO0,
+                              &rx_header, rx_data) != HAL_OK)
       {
-        controller = &controllers[axis_index];
         break;
       }
-    }
-    if (controller == NULL)
-    {
-      /* 未匹配到任何轴（可能是总线上的其他设备） → 丢弃 */
-      continue;
-    }
 
-    /*
-     * 解析 GM6020 反馈帧（8 字节大端）：
-     *   DATA[0:1] = 编码器角度（0~8191）
-     *   DATA[2:3] = 转速（rpm，有符号 int16）
-     *   DATA[4:5] = 转矩电流（±16384 ≈ ±3A）
-     *   DATA[6]   = 温度（℃）
-     *   DATA[7]   = 保留
-     */
-    controller->feedback.angle =
-        (uint16_t)(((uint16_t)rx_data[0] << 8) | rx_data[1]);
-    encoder_update(controller, controller->feedback.angle);
-    controller->feedback.speed_rpm =
-        (int16_t)(((uint16_t)rx_data[2] << 8) | rx_data[3]);
-    controller->feedback.torque_current =
-        (int16_t)(((uint16_t)rx_data[4] << 8) | rx_data[5]);
-    controller->feedback.temperature = rx_data[6];
-    controller->feedback.last_rx_ms = now;
-    ++controller->feedback.rx_sequence;
-    controller->feedback.online = true;
+      /* 过滤非标准数据帧（扩展帧、远程帧、DLC≠8 均丢弃） */
+      if ((rx_header.IDE != CAN_ID_STD)
+          || (rx_header.RTR != CAN_RTR_DATA)
+          || (rx_header.DLC != 8U))
+      {
+        continue;
+      }
 
-    /*
-     * 急停锁存期间仍更新编码器和在线状态，但禁止运行 PID，
-     * 并在每次反馈后继续发送零电流。
-     */
-    if (emergency_stop_latched)
-    {
-      controller->current_command = 0;
-      controller->target_speed_rpm = 0.0f;
+      /*
+       * 两台电机都是 ID 2（反馈 0x206），轴由物理 CAN 总线区分：
+       * CAN1 固定对应 Yaw，CAN2 固定对应 Pitch。
+       */
+      if (rx_header.StdId
+          != axis_can_config[axis_index].feedback_std_id)
+      {
+        continue;
+      }
+
+      /*
+       * 解析 GM6020 反馈帧（8 字节大端）：
+       *   DATA[0:1] = 编码器角度（0~8191）
+       *   DATA[2:3] = 转速（rpm，有符号 int16）
+       *   DATA[4:5] = 转矩电流（±16384 ≈ ±3A）
+       *   DATA[6]   = 温度（℃）
+       *   DATA[7]   = 保留
+       */
+      controller->feedback.angle =
+          (uint16_t)(((uint16_t)rx_data[0] << 8) | rx_data[1]);
+      encoder_update(controller, controller->feedback.angle);
+      controller->feedback.speed_rpm =
+          (int16_t)(((uint16_t)rx_data[2] << 8) | rx_data[3]);
+      controller->feedback.torque_current =
+          (int16_t)(((uint16_t)rx_data[4] << 8) | rx_data[5]);
+      controller->feedback.temperature = rx_data[6];
+      controller->feedback.last_rx_ms = now;
+      ++controller->feedback.rx_sequence;
+      controller->feedback.online = true;
+
+      if (emergency_stop_latched)
+      {
+        controller->current_command = 0;
+        controller->target_speed_rpm = 0.0f;
+      }
+      else
+      {
+        control_state_handle_feedback(controller);
+      }
+      command_changed[axis_index] = true;
     }
-    else
-    {
-      control_state_handle_feedback(controller);
-    }
-    command_changed = true;
   }
 
   /*
+  /* Phase 2: Timeout Detection — check each axis for feedback timeout */
    * --- 阶段2：超时检测 ---
    *
    * 重新获取时间戳（阶段1可能耗时），依次检查两轴。
    * 注意：这里用的是同一个 now，两轴的超时判断基于同一个时间基准。
    */
+  /* Re-fetch timestamp (phase 1 may have taken time); both axes share same time base */
   now = HAL_GetTick();
   for (axis_index = 0U;
        axis_index < (uint32_t)GM6020_AXIS_COUNT;
        ++axis_index)
   {
+    /* If timeout occurred → transition to FAULT → mark command_changed to re-send zero current */
     if (control_state_poll_timeout(
             &controllers[axis_index], now))
     {
-      command_changed = true;
+      command_changed[axis_index] = true;
     }
+  /* Phase 3: Send current command — only if that axis had a change (efficiency: skip idle transmits) */
   }
 
-  /*
-   * --- 阶段3：发送合并电流命令 ---
-   *
-   * 只在有变化时才发送，避免无意义地占用 CAN 总线带宽。
-   * 因为两个电机的电流打包在同一帧中，
-   * 任意一个轴电流变化都会触发一次发送。
-   */
-  if (command_changed)
+  /* 某轴电流变化时，只在该轴对应的 CAN 总线上发送。 */
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
   {
-    (void)gm6020_send_group_current();
+    if (command_changed[axis_index])
+    {
+      (void)gm6020_send_axis_current((GM6020_Axis_t)axis_index);
+    }
   }
 }
 

@@ -38,36 +38,38 @@
  */
 
 /*==================== 电机 CAN ID 配置 (Motor CAN ID Configuration) ====================*/
-/* Yaw (偏航) 电机 */
-#define YAW_FEEDBACK_STD_ID             0x205U   /* Yaw 反馈帧标准ID — Yaw feedback StdID */
-#define YAW_CURRENT_COMMAND_SLOT        0U       /* Yaw 电流命令在0x1FE中的槽位 (DATA[0:1]) */
+/* Yaw (偏航) 电机：上板 CAN1（经滑环连接下板 CAN2），GM6020 ID 2 */
+#define YAW_FEEDBACK_STD_ID             0x206U   /* ID 2 反馈帧标准 ID */
+#define YAW_CURRENT_COMMAND_SLOT        1U       /* ID 2 电流位于 0x1FE DATA[2:3] */
+#define YAW_CAN_FILTER_BANK             0U       /* CAN1 使用主过滤器组 0~13 */
 
-/* Pitch (俯仰) 电机 */
-#define PITCH_FEEDBACK_STD_ID           0x206U   /* Pitch 反馈帧标准ID — Pitch feedback StdID */
-#define PITCH_CURRENT_COMMAND_SLOT      1U       /* Pitch 电流命令在0x1FE中的槽位 (DATA[2:3]) */
+/* Pitch (俯仰) 电机：上板 CAN2，GM6020 ID 2 */
+#define PITCH_FEEDBACK_STD_ID           0x206U   /* ID 2 反馈帧标准 ID */
+#define PITCH_CURRENT_COMMAND_SLOT      1U       /* ID 2 电流位于 0x1FE DATA[2:3] */
+#define PITCH_CAN_FILTER_BANK           14U      /* CAN2 使用从过滤器组 14~27 */
 
 /*======================= Yaw 轴 PID 参数 (Yaw Axis PID Parameters) =======================*/
 /* ---- 速度环 (Speed Loop / Inner Loop) ---- */
-#define YAW_SPEED_PID_KP                20.0f    /* 比例增益 — proportional gain */
-#define YAW_SPEED_PID_KI                0.0f     /* 积分增益 — integral gain */
+#define YAW_SPEED_PID_KP                40.0f    /* 比例增益 — proportional gain */
+#define YAW_SPEED_PID_KI                12.0f     /* 积分增益 — integral gain */
 #define YAW_SPEED_PID_KD                0.0f     /* 微分增益 — derivative gain */
-#define YAW_SPEED_PID_OUTPUT_LIMIT      8192.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
+#define YAW_SPEED_PID_OUTPUT_LIMIT      10000.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
 
 /* ---- 角度环 (Angle Loop / Outer Loop) ---- */
-#define YAW_ANGLE_PID_KP                10.0f    /* 比例增益 — proportional gain */
-#define YAW_ANGLE_PID_KI                0.0f     /* 积分增益 — integral gain */
+#define YAW_ANGLE_PID_KP                40.0f    /* 比例增益 — proportional gain */
+#define YAW_ANGLE_PID_KI                5.0f     /* 积分增益 — integral gain */
 #define YAW_ANGLE_PID_KD                0.0f     /* 微分增益 — derivative gain */
 #define YAW_ANGLE_SPEED_LIMIT_RPM       200.0f   /* 角度环输出限幅 (目标转速上限 rpm) */
 
 /*===================== Pitch 轴 PID 参数 (Pitch Axis PID Parameters) =====================*/
 /* ---- 速度环 (Speed Loop) ---- */
-#define PITCH_SPEED_PID_KP              20.0f    /* 比例增益 — 俯仰惯量小，增益可比Yaw高 */
+#define PITCH_SPEED_PID_KP              40.0f    /* 第一阶段增力测试：由20提高到40 */
 #define PITCH_SPEED_PID_KI              0.0f     /* 积分增益 — integral gain */
 #define PITCH_SPEED_PID_KD              0.0f     /* 微分增益 — derivative gain */
-#define PITCH_SPEED_PID_OUTPUT_LIMIT    10000.0f  /* 速度环输出限幅 (转矩电流) */
+#define PITCH_SPEED_PID_OUTPUT_LIMIT    8192.0f  /* 速度环输出限幅 (转矩电流) */
 
 /* ---- 角度环 (Angle Loop) ---- */
-#define PITCH_ANGLE_PID_KP              10.0f    /* 比例增益 — proportional gain */
+#define PITCH_ANGLE_PID_KP              20.0f    /* 比例增益 — proportional gain */
 #define PITCH_ANGLE_PID_KI              0.0f     /* 积分增益 — integral gain */
 #define PITCH_ANGLE_PID_KD              0.0f     /* 微分增益 — derivative gain */
 #define PITCH_ANGLE_SPEED_LIMIT_RPM     100.0f   /* 角度环输出限幅 — 俯仰轴需更保守 */
@@ -98,17 +100,17 @@
  * 当前需求只指定 Yaw 限位，因此 Pitch 默认关闭。
  * 确定俯仰机械范围后可改为 1U，并填写上下限。
  */
-#define PITCH_ANGLE_LIMIT_ENABLE        0U       /* 软限位使能 — 0=关闭, 1=开启 */
+#define PITCH_ANGLE_LIMIT_ENABLE        1U       /* 软限位使能 — 0=关闭, 1=开启 */
 #define PITCH_MIN_ANGLE_DEG            (-30.0f)  /* 最小俯仰角度 — 低头 (look down) */
 #define PITCH_MAX_ANGLE_DEG             30.0f    /* 最大俯仰角度 — 抬头 (look up) */
 
 /*===================== 公共安全参数 (Common Safety Parameters) =====================*/
 /*
  * Yaw 单轴装机测试模式：
- *   1 = 只等待/标定/遥控 Yaw，发送 0x1FE 时强制 Pitch 电流槽为 0；
- *   0 = 恢复 Yaw + Pitch 双轴标定和遥控控制。
+ *   1 = 禁止Pitch遥控并强制0x1FE的Pitch电流槽为0；
+ *   0 = 启用Yaw和Pitch逐轴独立标定、在线检查及遥控控制。
  */
-#define GIMBAL_YAW_ONLY_TEST_MODE       1U
+#define GIMBAL_YAW_ONLY_TEST_MODE       0U
 
 /* 反馈超时阈值：100ms 内未收到有效 CAN 反馈 → FAULT 状态 → 输出零电流 */
 #define GM6020_FEEDBACK_TIMEOUT_MS      100U     /* 反馈超时 — feedback timeout (ms) */

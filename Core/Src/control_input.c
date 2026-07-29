@@ -103,7 +103,7 @@ typedef enum
   CONTROL_ACK_LOCKED,        /* 急停锁存中，拒绝命令 "LOCKED\r\n" */
   CONTROL_ACK_CALIBRATING,   /* 正在采集标定样本 */
   CONTROL_ACK_CALIBRATED,    /* 上电自动标定已完成 */
-  CONTROL_ACK_CALWAIT,       /* 等待两轴有效反馈 */
+  CONTROL_ACK_CALWAIT,       /* 至少一个未标定轴正在等待有效反馈 */
   CONTROL_ACK_CALMOVING,     /* 云台未静止，样本已重置 */
   CONTROL_ACK_CALERROR       /* 运行时应用零位失败 */
 } ControlAck_t;
@@ -413,7 +413,8 @@ static void transmit_pending_ack(void)
  *   3. 优先级处理：
  *      a) 急停请求 → GM6020 + ChassisCAN 同时急停 → 回复 ESTOPPED
  *      b) CLEAR 命令 → 清除双模块急停 → 回复 CLEARED
- *      c) 角度目标 → 校验急停锁存状态 → Yaw 使用多圈目标, Pitch 使用单圈目标
+ *      c) 角度目标 → 分别检查各轴在线和标定状态
+ *                    → Yaw使用多圈目标, Pitch使用单圈目标
  *                    → 回复 OK/LOCKED
  *      d) 其他 → 回复 ERR
  *
@@ -425,6 +426,9 @@ void control_in(void)
   bool line_invalid;
   bool line_available = false;
   bool emergency_stop_requested = false;
+  bool command_applied;
+  const GM6020_Feedback_t *yaw_feedback;
+  const GM6020_Feedback_t *pitch_feedback;
   uint32_t previous_primask;
   float yaw_angle_deg;
   float pitch_angle_deg;
@@ -501,18 +505,39 @@ void control_in(void)
            && parse_target_pair(
                line, &yaw_angle_deg, &pitch_angle_deg))
   {
-    if (GM6020_IsEmergencyStopped()
-        || GimbalCalibration_IsBusy())
+    if (GM6020_IsEmergencyStopped())
     {
       pending_ack = CONTROL_ACK_LOCKED;
     }
     else
     {
-      GM6020_SetMultiTurnTargetPosition(
-          GM6020_AXIS_YAW, yaw_angle_deg);
-      GM6020_SetTargetPosition(
-          GM6020_AXIS_PITCH, pitch_angle_deg);
-      pending_ack = CONTROL_ACK_OK;
+      command_applied = false;
+      yaw_feedback = GM6020_GetFeedback(GM6020_AXIS_YAW);
+      pitch_feedback = GM6020_GetFeedback(GM6020_AXIS_PITCH);
+
+      if (GimbalCalibration_IsAxisCalibrated(
+              GM6020_AXIS_YAW)
+          && (yaw_feedback != NULL)
+          && yaw_feedback->online)
+      {
+        GM6020_SetMultiTurnTargetPosition(
+            GM6020_AXIS_YAW, yaw_angle_deg);
+        command_applied = true;
+      }
+
+      if (GimbalCalibration_IsAxisCalibrated(
+              GM6020_AXIS_PITCH)
+          && (pitch_feedback != NULL)
+          && pitch_feedback->online)
+      {
+        GM6020_SetTargetPosition(
+            GM6020_AXIS_PITCH, pitch_angle_deg);
+        command_applied = true;
+      }
+
+      pending_ack = command_applied
+          ? CONTROL_ACK_OK
+          : CONTROL_ACK_LOCKED;
     }
   }
   else

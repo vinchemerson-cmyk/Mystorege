@@ -23,15 +23,65 @@
 #include "main.h"
 #include "cmsis_os.h"
 
+/**
+ * ===========================================================================
+ * @file    freertos.c
+ * @brief   FreeRTOS 任务创建与 gimbalTask 主控制循环
+ * ===========================================================================
+ *
+ * 【RTOS 架构说明 (RTOS Architecture)】
+ *   本系统从原裸机 while(1) 主循环迁移到 FreeRTOS 架构：
+ *   - gimbalTask (512×4 字节栈, osPriorityHigh) 负责云台控制
+ *   - imuTask (512×4 字节栈, osPriorityAboveNormal) 负责BMI088采集
+ *   - 两个任务均以 1 ms 固定周期运行
+ *   - 保留原裸机主循环的调用顺序，确保行为一致性
+ *
+ *   当前任务架构：
+ *     gimbalTask   (1 kHz) — 电机控制、上位机协议、标定、遥控器
+ *     imuTask      (1 kHz) — BMI088六轴原始数据与温度采集
+ *   未来可继续扩展：
+ *     commTask     (异步) — USB CDC 收发、USART 调试输出
+ *     safetyTask   (50 Hz) — 超时检测、看门狗喂狗、心跳 LED
+ *
+ * 【任务周期 (Task Period & Scheduling)】
+ *   vTaskDelayUntil(&last_wake_time, 1ms) 确保精确 1 kHz 调度：
+ *   - 使用绝对唤醒时间 (absolute wake time)，不会累积漂移
+ *   - 控制周期 = 1 ms → 与 GM6020 反馈帧速率 (~1 kHz) 匹配
+ *   - DBUS_Monitor_Process() 内部自己节流 (50 ms)
+ *   - ChassisCAN_Process() 内部自己节流 (10 ms)
+ *
+ * 【与原裸机主循环的差异 (vs Bare-Metal)】
+ *   裸机 main.c while(1)                     RTOS gimbalTask for(;;)
+ *   ─────────────────────────────────       ──────────────────────
+ *   control_in()                            DBUS_Process()        ← 新增
+ *   GM6020_Process()                        control_in()
+ *   control_out()                           GM6020_Process()
+ *   ChassisCAN_Process()                    GimbalCalibration_Process() ← 新增
+ *                                           RemoteGimbalControl_Process() ← 新增
+ *                                           DBUS_Monitor_Process()      ← 新增
+ *                                           ChassisCAN_Process()
+ *
+ * 【FreeRTOS 钩子函数 (Hook Functions)】
+ *   - vApplicationStackOverflowHook  — 栈溢出保护：关中断 → 死循环
+ *   - vApplicationMallocFailedHook   — 动态内存分配失败：关中断 → 死循环
+ * ===========================================================================
+ */
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "chassis_can.h"
-#include "control_input.h"
-#include "dbus.h"
-#include "dbus_monitor.h"
-#include "gimbal_calibration.h"
-#include "motor_control.h"
-#include "remote_gimbal_control.h"
+/*
+ * 项目自定义模块 (Project custom modules)。
+ *   原裸机所有模块在此处包含，RTOS 任务中调度。
+ */
+#include "chassis_can.h"         /* CAN2 底盘控制 */
+#include "bmi088.h"              /* BMI088六轴原始数据采集 */
+#include "bmi088_monitor.h"      /* BMI088 USB诊断与原始数据输出 */
+#include "control_input.h"       /* USB CDC 串口协议 */
+#include "dbus.h"                /* DBUS 遥控器接收 */
+#include "dbus_monitor.h"        /* DBUS 数据 USB CDC 监视输出 */
+#include "gimbal_calibration.h"  /* 云台零位 Flash 标定 */
+#include "motor_control.h"       /* 双轴 GM6020 电机控制 */
+#include "remote_gimbal_control.h" /* DBUS 摇杆映射到云台目标 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,7 +91,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define GIMBAL_CONTROL_PERIOD_MS  1U
+/*
+ * 云台控制任务执行周期：1 ms → 1 kHz。
+ * 与 GM6020 电机反馈帧推送频率 (~1 kHz) 匹配，
+ * 确保每个控制周期都能处理最新收到的反馈帧。
+ */
+#define GIMBAL_CONTROL_PERIOD_MS  1U    /* 控制任务周期 — control task period (ms) */
+#define IMU_ACQUISITION_PERIOD_MS 1U    /* IMU采集任务周期 — acquisition period (ms) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,12 +109,32 @@
 /* USER CODE BEGIN Variables */
 
 /* USER CODE END Variables */
-/* Definitions for gimbalTask */
-osThreadId_t gimbalTaskHandle;
+/*
+ * ─── 云台控制任务定义 (Gimbal Control Task Definition) ───
+ *
+ * 栈大小: 512 × 4 = 2048 字节 (CMSIS-RTOS v2 以 uint32_t 为单位)。
+ *   实际分配: 2048 bytes ≈ 2 KiB。
+ *   各模块栈用量估算: 电机控制 PID 栈变量 ~200B + CAN 收发 ~100B
+ *                   + USB CDC 缓冲 ~200B + FreeRTOS 上下文 ~100B
+ *                   → 总 ~600B（留有充足裕度用于嵌套中断和函数调用）
+ * 优先级: osPriorityHigh (仅次于系统 Tick/SVC 中断)
+ */
+osThreadId_t gimbalTaskHandle;                        /* 任务句柄 — task handle (for osThread* APIs) */
 const osThreadAttr_t gimbalTask_attributes = {
-  .name = "gimbalTask",
+  .name       = "gimbalTask",                         /* 任务名称 — task name (debugger display) */
+  .stack_size = 512 * 4,                              /* 栈大小 — stack size in uint32_t units (2 KiB) */
+  .priority   = (osPriority_t) osPriorityHigh,        /* 任务优先级 — high priority */
+};
+
+/*
+ * IMU采集任务优先级低于云台控制任务。两个任务同时就绪时，
+ * 先执行电机控制，再进行阻塞式SPI读取，避免IMU采集延迟控制周期。
+ */
+osThreadId_t imuTaskHandle;
+const osThreadAttr_t imuTask_attributes = {
+  .name       = "imuTask",
   .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityHigh,
+  .priority   = (osPriority_t) osPriorityAboveNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +143,7 @@ const osThreadAttr_t gimbalTask_attributes = {
 /* USER CODE END FunctionPrototypes */
 
 void StartGimbalTask(void *argument);
+void StartImuTask(void *argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -101,6 +178,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of gimbalTask */
   gimbalTaskHandle = osThreadNew(StartGimbalTask, NULL, &gimbalTask_attributes);
 
+  /* creation of imuTask */
+  imuTaskHandle = osThreadNew(StartImuTask, NULL, &imuTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -118,18 +198,37 @@ void MX_FREERTOS_Init(void) {
   * @retval None
   */
 /* USER CODE END Header_StartGimbalTask */
+/*
+ * ─── 云台控制任务主函数 (Gimbal Control Task Main Function) ───
+ *
+ * FreeRTOS 在调度器启动后调用此函数。无限循环以 1 ms 固定周期运行。
+ * 调度顺序与原裸机主循环保持一致，新增 DBUS 遥控器和标定模块。
+ */
 void StartGimbalTask(void *argument)
 {
-  /* init code for USB_DEVICE */
-  MX_USB_DEVICE_Init();
+  /* ---- 任务初始化阶段 (Task Initialization) ---- */
+  MX_USB_DEVICE_Init();          /* USB CDC 虚拟串口初始化 */
   /* USER CODE BEGIN StartGimbalTask */
-  TickType_t last_wake_time = xTaskGetTickCount();
+  TickType_t last_wake_time = xTaskGetTickCount(); /* 记录调度器启动时刻作为基准 */
 
-  (void)argument;
+  (void)argument;  /* 未使用参数 — unused FreeRTOS task argument */
 
   /*
+   * ─── 主控制循环 (Main Control Loop) ───
+   *
    * 保留原裸机主循环的调用顺序，避免 RTOS 迁移改变控制行为。
-   * 任务使用绝对唤醒时间，以 1 ms 周期运行且不累积调度漂移。
+   * vTaskDelayUntil() 使用绝对唤醒时间，确保 1 ms 精确周期
+   * 且不累积调度漂移 (no cumulative drift)。
+   *
+   * 调用顺序及频率：
+   *   1. DBUS_Process()                — 解析 DBUS 帧, 与反馈速率同步 (~1 kHz)
+   *   2. control_in()                   — 串口命令处理, 有命令时才动作
+   *   3. GM6020_Process()              — 电机控制, 与 CAN 反馈同步 (~1 kHz)
+   *   4. GimbalCalibration_Process()   — 标定状态机, 空操作除非标定中
+   *   5. RemoteGimbalControl_Process() — 摇杆映射, 每周期积分
+   *   6. BMI088_Monitor_Process()      — 读取快照并输出 (20 ms=50 Hz)
+   *   7. DBUS_Monitor_Process()        — 内部节流 (50 ms=20 Hz)
+   *   8. ChassisCAN_Process()          — 内部节流 (10 ms=100 Hz)
    */
   for(;;)
   {
@@ -138,10 +237,12 @@ void StartGimbalTask(void *argument)
     GM6020_Process();
     GimbalCalibration_Process();
     RemoteGimbalControl_Process();
-    /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 */
-    DBUS_Monitor_Process();
+    BMI088_Monitor_Process();
+    /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 (暂停后可减小 USB 带宽占用) */
+    /* DBUS_Monitor_Process(); */  /* RC数据已验证，暂停USB CDC周期上报 */
     ChassisCAN_Process();
 
+    /* 绝对延迟 1 ms — 与下一拍唤醒时间对齐，不累积漂移 */
     vTaskDelayUntil(
         &last_wake_time,
         pdMS_TO_TICKS(GIMBAL_CONTROL_PERIOD_MS));
@@ -149,24 +250,59 @@ void StartGimbalTask(void *argument)
   /* USER CODE END StartGimbalTask */
 }
 
+/* USER CODE BEGIN Header_StartImuTask */
+/**
+  * @brief  Function implementing the imuTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartImuTask */
+void StartImuTask(void *argument)
+{
+  /* USER CODE BEGIN StartImuTask */
+  TickType_t last_wake_time = xTaskGetTickCount();
+
+  (void)argument;
+
+  for (;;)
+  {
+    (void)BMI088_ReadSample();
+    vTaskDelayUntil(
+        &last_wake_time,
+        pdMS_TO_TICKS(IMU_ACQUISITION_PERIOD_MS));
+  }
+  /* USER CODE END StartImuTask */
+}
+
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
+/*
+ * FreeRTOS 栈溢出钩子 (Stack Overflow Hook)。
+ * 当任务的栈使用量超过分配值时，FreeRTOS 在任务上下文切换时调用此函数。
+ * 处理方式：禁用所有中断 + 死循环（等待看门狗复位或手动重启）。
+ * 生产环境中可在此处写错误码到备份寄存器或触发外部看门狗。
+ */
 void vApplicationStackOverflowHook(TaskHandle_t task,
                                    char *task_name)
 {
-  (void)task;
-  (void)task_name;
-  taskDISABLE_INTERRUPTS();
-  for (;;)
+  (void)task;       /* 溢出任务句柄 — 可用于调试器或日志记录 */
+  (void)task_name;  /* 溢出任务名称 — 可在调试器中查看 */
+  taskDISABLE_INTERRUPTS();  /* 禁止中断 → 停止调度器 */
+  for (;;)                   /* 死循环 → 等待看门狗复位 */
   {
   }
 }
 
+/*
+ * FreeRTOS 内存分配失败钩子 (Malloc Failed Hook)。
+ * 当 pvPortMalloc() 无法分配请求的内存时调用。
+ * 处理方式：同栈溢出（关中断+死循环）。
+ */
 void vApplicationMallocFailedHook(void)
 {
-  taskDISABLE_INTERRUPTS();
-  for (;;)
+  taskDISABLE_INTERRUPTS();  /* 禁止中断 → 停止调度器 */
+  for (;;)                   /* 死循环 → 等待看门狗复位 */
   {
   }
 }

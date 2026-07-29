@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#include "motor_control.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -24,12 +26,20 @@ typedef enum
 void GimbalCalibration_Init(void);
 
 /*
- * 采集两轴各 100 个新的静止反馈，把开机姿态设置为机械零点。
- * 标定完成后，电机控制器继续保持该位置。
+ * 两轴分别采集100个新的静止反馈，把各自开机姿态设置为机械零点。
+ * 任一轴可在另一轴离线时独立完成标定。
  */
 void GimbalCalibration_Process(void);
 
+/* 返回双轴汇总状态，主要用于CALSTATUS诊断。 */
 GimbalCalibrationStatus_t GimbalCalibration_GetStatus(void);
+
+/* 查询单轴标定状态或是否已经可用于控制。 */
+GimbalCalibrationStatus_t GimbalCalibration_GetAxisStatus(
+    GM6020_Axis_t axis);
+bool GimbalCalibration_IsAxisCalibrated(
+    GM6020_Axis_t axis);
+
 bool GimbalCalibration_IsBusy(void);
 uint16_t GimbalCalibration_GetYawSampleCount(void);
 uint16_t GimbalCalibration_GetPitchSampleCount(void);

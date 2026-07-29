@@ -12,14 +12,23 @@
 extern "C" {
 #endif
 
-/* 初始化遥控器云台目标积分器。 */
+/*
+ * 初始化遥控器云台目标积分器 (Initialize remote gimbal target integrator)。
+ * 清零目标角度和执行时间戳。
+ */
 void RemoteGimbalControl_Init(void);
 
 /*
- * 主循环周期调用。
+ * 主循环周期调用 (Main loop periodic call)。
  *
- * CH0 控制 Yaw 目标角速度，CH1 控制 Pitch 目标角速度；
- * 摇杆回中时保持当前目标位置。
+ * CH0 控制 Yaw 目标角速度 (target angular rate)，
+ * CH1 控制 Pitch 目标角速度。
+ * 摇杆在死区内（回中）时归一化输出为 0，目标角度保持不变。
+ *
+ * 每轴独立接管条件：
+ *   - DBUS在线 + 该轴标定完成 + 未急停 + 该轴电机在线
+ * 某轴条件不满足时只暂停该轴，另一轴继续运行；恢复后该轴从实时位置
+ * 重新同步目标。
  */
 void RemoteGimbalControl_Process(void);
 

@@ -26,6 +26,19 @@
  *
  * 1 tab == 4 spaces!
  */
+/**
+ * ===========================================================================
+ * @note  本文件由 STM32CubeMX 自动生成。FreeRTOS 内核配置。
+ *        项目关键配置:
+ *          - configCPU_CLOCK_HZ = 168000000 (HCLK)
+ *          - configTICK_RATE_HZ  = 1000 (1 kHz Tick)
+ *          - configUSE_TIMERS    = 0 (不使用软件定时器)
+ *          - configMINIMAL_STACK_SIZE = 128 words × 4 = 512 bytes
+ *          - SysTick 用于 FreeRTOS 心跳，TIM6 用于 HAL 时基
+ *          - configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5
+ *            (中断优先级 0~4 可调用 FreeRTOS API，5~15 不可调用)
+ * ===========================================================================
+ */
 /* USER CODE END Header */
 
 #ifndef FREERTOS_CONFIG_H

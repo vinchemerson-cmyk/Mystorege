@@ -1,6 +1,5 @@
 #include "gimbal_calibration.h"
 
-#include "config/gimbal_params.h"
 #include "motor_control.h"
 
 #include <string.h>
@@ -11,7 +10,7 @@
 
 typedef struct
 {
-  GimbalCalibrationStatus_t status;
+  GimbalCalibrationStatus_t status[GM6020_AXIS_COUNT];
   uint32_t last_sequence[GM6020_AXIS_COUNT];
   uint16_t sample_count[GM6020_AXIS_COUNT];
   int32_t reference_ecd[GM6020_AXIS_COUNT];
@@ -23,23 +22,24 @@ typedef struct
 
 static CalibrationContext_t calibration;
 
-static void calibration_reset_samples(void)
+static bool calibration_axis_is_valid(GM6020_Axis_t axis)
 {
-  const GM6020_Feedback_t *yaw =
-      GM6020_GetFeedback(GM6020_AXIS_YAW);
-  const GM6020_Feedback_t *pitch =
-      GM6020_GetFeedback(GM6020_AXIS_PITCH);
+  return ((uint32_t)axis < (uint32_t)GM6020_AXIS_COUNT);
+}
 
-  calibration.sample_count[GM6020_AXIS_YAW] = 0U;
-  calibration.sample_count[GM6020_AXIS_PITCH] = 0U;
-  calibration.reference_valid[GM6020_AXIS_YAW] = false;
-  calibration.reference_valid[GM6020_AXIS_PITCH] = false;
-  calibration.sum_unwrapped_ecd[GM6020_AXIS_YAW] = 0;
-  calibration.sum_unwrapped_ecd[GM6020_AXIS_PITCH] = 0;
-  calibration.last_sequence[GM6020_AXIS_YAW] =
-      (yaw != NULL) ? yaw->rx_sequence : 0U;
-  calibration.last_sequence[GM6020_AXIS_PITCH] =
-      (pitch != NULL) ? pitch->rx_sequence : 0U;
+static void calibration_reset_axis(
+    GM6020_Axis_t axis,
+    GimbalCalibrationStatus_t status)
+{
+  const GM6020_Feedback_t *feedback =
+      GM6020_GetFeedback(axis);
+
+  calibration.sample_count[axis] = 0U;
+  calibration.reference_valid[axis] = false;
+  calibration.sum_unwrapped_ecd[axis] = 0;
+  calibration.last_sequence[axis] =
+      (feedback != NULL) ? feedback->rx_sequence : 0U;
+  calibration.status[axis] = status;
 }
 
 static bool calibration_sample_axis(
@@ -126,123 +126,165 @@ static uint16_t calibration_average_axis(GM6020_Axis_t axis)
 
 void GimbalCalibration_Init(void)
 {
+  uint32_t axis_index;
+
   memset(&calibration, 0, sizeof(calibration));
-  calibration_reset_samples();
-  calibration.status = GIMBAL_CALIBRATION_WAITING_FEEDBACK;
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    calibration_reset_axis(
+        (GM6020_Axis_t)axis_index,
+        GIMBAL_CALIBRATION_WAITING_FEEDBACK);
+  }
 }
 
 void GimbalCalibration_Process(void)
 {
-  const GM6020_Feedback_t *feedback[GM6020_AXIS_COUNT];
-  uint16_t yaw_zero_ecd;
-#if !GIMBAL_YAW_ONLY_TEST_MODE
-  uint16_t pitch_zero_ecd;
-#endif
+  uint32_t axis_index;
 
-  if (!GimbalCalibration_IsBusy())
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
   {
-    return;
+    const GM6020_Axis_t axis =
+        (GM6020_Axis_t)axis_index;
+    const GM6020_Feedback_t *feedback;
+    uint16_t zero_ecd;
+
+    if ((calibration.status[axis]
+         == GIMBAL_CALIBRATION_CALIBRATED)
+        || (calibration.status[axis]
+            == GIMBAL_CALIBRATION_ERROR))
+    {
+      continue;
+    }
+
+    feedback = GM6020_GetFeedback(axis);
+    if ((feedback == NULL) || !feedback->online)
+    {
+      calibration_reset_axis(
+          axis,
+          GIMBAL_CALIBRATION_WAITING_FEEDBACK);
+      continue;
+    }
+
+    if ((feedback->speed_rpm
+         > CALIBRATION_STILL_SPEED_RPM)
+        || (feedback->speed_rpm
+            < -CALIBRATION_STILL_SPEED_RPM))
+    {
+      calibration_reset_axis(
+          axis,
+          GIMBAL_CALIBRATION_WAITING_STILL);
+      continue;
+    }
+
+    calibration.status[axis] =
+        GIMBAL_CALIBRATION_SAMPLING;
+    if (!calibration_sample_axis(axis, feedback))
+    {
+      calibration_reset_axis(
+          axis,
+          GIMBAL_CALIBRATION_WAITING_STILL);
+      continue;
+    }
+
+    if (calibration.sample_count[axis]
+        < CALIBRATION_SAMPLE_COUNT)
+    {
+      continue;
+    }
+
+    zero_ecd = calibration_average_axis(axis);
+    calibration.status[axis] =
+        GM6020_SetAxisZeroOffsetEcd(axis, zero_ecd)
+        ? GIMBAL_CALIBRATION_CALIBRATED
+        : GIMBAL_CALIBRATION_ERROR;
   }
-
-  feedback[GM6020_AXIS_YAW] =
-      GM6020_GetFeedback(GM6020_AXIS_YAW);
-#if !GIMBAL_YAW_ONLY_TEST_MODE
-  feedback[GM6020_AXIS_PITCH] =
-      GM6020_GetFeedback(GM6020_AXIS_PITCH);
-#endif
-
-#if GIMBAL_YAW_ONLY_TEST_MODE
-  if ((feedback[GM6020_AXIS_YAW] == NULL)
-      || !feedback[GM6020_AXIS_YAW]->online)
-#else
-  if ((feedback[GM6020_AXIS_YAW] == NULL)
-      || (feedback[GM6020_AXIS_PITCH] == NULL)
-      || !feedback[GM6020_AXIS_YAW]->online
-      || !feedback[GM6020_AXIS_PITCH]->online)
-#endif
-  {
-    calibration_reset_samples();
-    calibration.status = GIMBAL_CALIBRATION_WAITING_FEEDBACK;
-    return;
-  }
-
-  if ((feedback[GM6020_AXIS_YAW]->speed_rpm
-       > CALIBRATION_STILL_SPEED_RPM)
-      || (feedback[GM6020_AXIS_YAW]->speed_rpm
-          < -CALIBRATION_STILL_SPEED_RPM)
-#if !GIMBAL_YAW_ONLY_TEST_MODE
-      || (feedback[GM6020_AXIS_PITCH]->speed_rpm
-          > CALIBRATION_STILL_SPEED_RPM)
-      || (feedback[GM6020_AXIS_PITCH]->speed_rpm
-          < -CALIBRATION_STILL_SPEED_RPM))
-#else
-      )
-#endif
-  {
-    calibration_reset_samples();
-    calibration.status = GIMBAL_CALIBRATION_WAITING_STILL;
-    return;
-  }
-
-  calibration.status = GIMBAL_CALIBRATION_SAMPLING;
-  if (!calibration_sample_axis(
-          GM6020_AXIS_YAW,
-          feedback[GM6020_AXIS_YAW])
-#if !GIMBAL_YAW_ONLY_TEST_MODE
-      || !calibration_sample_axis(
-          GM6020_AXIS_PITCH,
-          feedback[GM6020_AXIS_PITCH]))
-#else
-      )
-#endif
-  {
-    calibration_reset_samples();
-    calibration.status = GIMBAL_CALIBRATION_WAITING_STILL;
-    return;
-  }
-
-  if (calibration.sample_count[GM6020_AXIS_YAW]
-      < CALIBRATION_SAMPLE_COUNT
-#if !GIMBAL_YAW_ONLY_TEST_MODE
-      || (calibration.sample_count[GM6020_AXIS_PITCH]
-          < CALIBRATION_SAMPLE_COUNT))
-#else
-      )
-#endif
-  {
-    return;
-  }
-
-  yaw_zero_ecd = calibration_average_axis(GM6020_AXIS_YAW);
-#if GIMBAL_YAW_ONLY_TEST_MODE
-  if (!GM6020_SetAxisZeroOffsetEcd(
-          GM6020_AXIS_YAW, yaw_zero_ecd))
-#else
-  pitch_zero_ecd = calibration_average_axis(GM6020_AXIS_PITCH);
-  if (!GM6020_SetZeroOffsetsEcd(
-          yaw_zero_ecd, pitch_zero_ecd))
-#endif
-  {
-    calibration.status = GIMBAL_CALIBRATION_ERROR;
-    return;
-  }
-
-  calibration.status = GIMBAL_CALIBRATION_CALIBRATED;
 }
 
 GimbalCalibrationStatus_t GimbalCalibration_GetStatus(void)
 {
-  return calibration.status;
+  uint32_t axis_index;
+  bool any_waiting_feedback = false;
+  bool any_waiting_still = false;
+  bool any_sampling = false;
+
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    switch (calibration.status[axis_index])
+    {
+      case GIMBAL_CALIBRATION_ERROR:
+        return GIMBAL_CALIBRATION_ERROR;
+      case GIMBAL_CALIBRATION_SAMPLING:
+        any_sampling = true;
+        break;
+      case GIMBAL_CALIBRATION_WAITING_STILL:
+        any_waiting_still = true;
+        break;
+      case GIMBAL_CALIBRATION_WAITING_FEEDBACK:
+        any_waiting_feedback = true;
+        break;
+      case GIMBAL_CALIBRATION_CALIBRATED:
+      default:
+        break;
+    }
+  }
+
+  if (any_sampling)
+  {
+    return GIMBAL_CALIBRATION_SAMPLING;
+  }
+  if (any_waiting_still)
+  {
+    return GIMBAL_CALIBRATION_WAITING_STILL;
+  }
+  if (any_waiting_feedback)
+  {
+    return GIMBAL_CALIBRATION_WAITING_FEEDBACK;
+  }
+  return GIMBAL_CALIBRATION_CALIBRATED;
+}
+
+GimbalCalibrationStatus_t GimbalCalibration_GetAxisStatus(
+    GM6020_Axis_t axis)
+{
+  if (!calibration_axis_is_valid(axis))
+  {
+    return GIMBAL_CALIBRATION_ERROR;
+  }
+  return calibration.status[axis];
+}
+
+bool GimbalCalibration_IsAxisCalibrated(
+    GM6020_Axis_t axis)
+{
+  return GimbalCalibration_GetAxisStatus(axis)
+      == GIMBAL_CALIBRATION_CALIBRATED;
 }
 
 bool GimbalCalibration_IsBusy(void)
 {
-  return (calibration.status
-          == GIMBAL_CALIBRATION_WAITING_FEEDBACK)
-      || (calibration.status
-          == GIMBAL_CALIBRATION_WAITING_STILL)
-      || (calibration.status
-          == GIMBAL_CALIBRATION_SAMPLING);
+  uint32_t axis_index;
+
+  for (axis_index = 0U;
+       axis_index < (uint32_t)GM6020_AXIS_COUNT;
+       ++axis_index)
+  {
+    const GimbalCalibrationStatus_t status =
+        calibration.status[axis_index];
+
+    if ((status == GIMBAL_CALIBRATION_WAITING_FEEDBACK)
+        || (status == GIMBAL_CALIBRATION_WAITING_STILL)
+        || (status == GIMBAL_CALIBRATION_SAMPLING))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint16_t GimbalCalibration_GetYawSampleCount(void)

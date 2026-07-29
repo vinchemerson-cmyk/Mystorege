@@ -20,6 +20,25 @@
   */
 /* USER CODE END Header */
 
+/**
+ * ===========================================================================
+ * @note  本文件由 STM32CubeMX 自动生成，控制 HAL 库各外设模块的编译开关。
+ *        项目已启用的 HAL 模块及其用途：
+ *
+ *          HAL_CAN_MODULE_ENABLED   — CAN1 (云台电机) + CAN2 (底盘控制)
+ *          HAL_TIM_MODULE_ENABLED   — TIM6 (HAL 时基, 替代 SysTick)
+ *          HAL_UART_MODULE_ENABLED  — USART6 (调试串口) + USART3 (DBUS 遥控器)
+ *          HAL_SPI_MODULE_ENABLED   — SPI (预留)
+ *          HAL_PCD_MODULE_ENABLED   — USB OTG FS (USB CDC 虚拟串口)
+ *          HAL_DMA_MODULE_ENABLED   — DMA1 (DBUS 接收) + DMA2 (预留)
+ *          HAL_GPIO_MODULE_ENABLED  — GPIO 始终启用 (自动)
+ *          HAL_CORTEX_MODULE_ENABLED — Cortex-M4 NVIC/MPU 始终启用 (自动)
+ *
+ *        未启用的模块被注释 (#define 前有 //)，以减小编译体积。
+ *        如需添加新外设 (如 I2C/SPI)，取消对应行注释即可。
+ * ===========================================================================
+ */
+
 /* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __STM32F4xx_HAL_CONF_H
 #define __STM32F4xx_HAL_CONF_H
@@ -62,7 +81,7 @@
 /* #define HAL_SAI_MODULE_ENABLED */
 /* #define HAL_SD_MODULE_ENABLED */
 /* #define HAL_MMC_MODULE_ENABLED */
-/* #define HAL_SPI_MODULE_ENABLED */
+#define HAL_SPI_MODULE_ENABLED
 #define HAL_TIM_MODULE_ENABLED
 #define HAL_UART_MODULE_ENABLED
 /* #define HAL_USART_MODULE_ENABLED */

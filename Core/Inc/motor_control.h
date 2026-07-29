@@ -33,7 +33,8 @@
  *
  * 【依赖】
  *   config/gimbal_params.h  CAN ID、PID 增益、零位偏置、软限位
- *   CAN1 硬件 (PD0/PD1)     电机反馈总线
+ *   CAN1 硬件 (PD0/PD1)     Yaw 电机总线（经滑环到下板 CAN2）
+ *   CAN2 硬件 (PB5/PB6)     Pitch 电机总线
  *
  * 【控制架构】参见 motor_control.c 文件头注释。
  * ===========================================================================
@@ -55,9 +56,9 @@ extern "C" {
 /*
  * 轴枚举 (Axis Enumeration)。
  *
- * 默认电机 ID 映射：
- *   Yaw   (偏航 / Yaw axis)    → GM6020 ID 1，CAN 反馈帧 StdId = 0x205
- *   Pitch (俯仰 / Pitch axis)  → GM6020 ID 2，CAN 反馈帧 StdId = 0x206
+ * 当前电机映射：
+ *   Yaw   (偏航 / Yaw axis)    → 上板 CAN1，GM6020 ID 2，反馈 StdId = 0x206
+ *   Pitch (俯仰 / Pitch axis)  → 上板 CAN2，GM6020 ID 2，反馈 StdId = 0x206
  *
  * GM6020_AXIS_COUNT 用于数组大小声明和循环边界。
  */
@@ -121,20 +122,22 @@ typedef struct
  * 初始化 Yaw/Pitch 两轴控制器。
  *
  * 内部流程：
- *   1. 校验两轴 CAN ID 和电流槽位不冲突
- *   2. 遍历两轴 → 配置校验 → 控制器初始化 → CAN 硬件滤波器配置
- *   3. 启动 CAN 外设
- *   4. 发送初始 0x1FE 零电流帧
+ *   1. 校验 Yaw/Pitch CAN 句柄和轴配置
+ *   2. 配置 CAN1/Yaw 与 CAN2/Pitch 的独立硬件滤波器
+ *   3. 启动两路 CAN 外设
+ *   4. 在两条总线上分别发送初始 0x1FE 零电流帧
  *
- * 必须在 MX_CAN1_Init() 之后调用。
+ * 必须在 MX_CAN1_Init() 和 MX_CAN2_Init() 之后调用。
  * 返回 HAL_OK 表示成功，否则应调用 Error_Handler()。
  */
-HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *hcan);
+HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *yaw_can,
+                              CAN_HandleTypeDef *pitch_can);
 
 /*
  * 锁存式急停。
  *
- * 调用后立即把两轴 0x1FE 电流命令置零，并阻止位置/速度命令生效。
+ * 调用后立即在两条 CAN 总线上分别发送 0x1FE 零电流命令，
+ * 并阻止位置/速度命令生效。
  * 急停状态会保持到 GM6020_ClearEmergencyStop() 被显式调用。
  */
 HAL_StatusTypeDef GM6020_EmergencyStop(void);
@@ -261,9 +264,9 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
  *
  * 每轮调用执行：
  *   1. 接收 CAN RX FIFO0 中所有待处理反馈帧
- *   2. 按 StdId 匹配到对应轴 → 更新反馈 → 编码器累计 → 状态机 → PID
+ *   2. 按 CAN1/Yaw、CAN2/Pitch 路由反馈 → 编码器累计 → 状态机 → PID
  *   3. 按配置的反馈超时时间检查两轴在线状态
- *   4. 若有电流变化，发送合并 0x1FE 帧
+ *   4. 若某轴电流变化，在该轴对应 CAN 总线上发送 0x1FE 帧
  *
  * 控制频率自然锁定在电机反馈帧发送频率（约 1 kHz），无需定时器。
  */

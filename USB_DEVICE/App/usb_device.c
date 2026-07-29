@@ -18,6 +18,22 @@
   */
 /* USER CODE END Header */
 
+/**
+ * ===========================================================================
+ * @note  本文件由 STM32CubeMX 自动生成，初始化 USB OTG FS 设备为 CDC 虚拟串口。
+ *
+ *        USB 硬件配置:
+ *          - USB OTG FS (Full Speed, 12 Mbps)
+ *          - PA11=DM, PA12=DP (AF10)
+ *          - 端点: 4 endpoints
+ *          - 无 DMA, 无 VBUS 检测
+ *          - 接收 FIFO=128 × 4 bytes, 发送 FIFO0=64 × 4, FIFO1=128 × 4
+ *
+ *        初始化流程: Init → RegisterClass(CDC) → RegisterInterface → Start
+ *        失败则调用 Error_Handler() 进入死循环。
+ * ===========================================================================
+ */
+
 /* Includes ------------------------------------------------------------------*/
 
 #include "usb_device.h"

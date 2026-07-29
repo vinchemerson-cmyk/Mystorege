@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
+#include "spi.h"
 #include "usart.h"
 #include "usb_device.h"
 #include "gpio.h"
@@ -37,6 +38,8 @@
  *   remote_gimbal_control.h — DBUS 摇杆到双轴云台位置目标的映射
  */
 #include "chassis_can.h"
+#include "bmi088.h"
+#include "bmi088_monitor.h"
 #include "control_input.h"
 #include "dbus.h"
 #include "dbus_monitor.h"
@@ -129,6 +132,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_SPI1_Init();
   MX_DMA_Init();
   MX_CAN1_Init();
   MX_USART6_UART_Init();
@@ -139,21 +143,20 @@ int main(void)
   /* ---- 阶段2：业务模块初始化 ---- */
 
   /*
-   * 初始化双轴 GM6020 电机控制器。
-   * 内部流程：校验配置（CAN ID/电流槽位无冲突） → 配置 CAN 滤波器
-   *         （0x205 接收 Yaw, 0x206 接收 Pitch） → 启动 CAN1
-   *         → 发送初始零电流命令（0x1FE 帧）。
-   * 必须在 MX_CAN1_Init() 之后调用（依赖 hcan1 句柄已初始化）。
+   * 初始化双轴 GM6020 电机控制器：
+   *   Yaw   → 上板 CAN1（经滑环到下板 CAN2），ID 2，反馈 0x206
+   *   Pitch → 上板 CAN2，ID 2，反馈 0x206
+   * 两条总线各自配置滤波器并分别发送 0x1FE 电流帧。
    */
-  if (GM6020_Init(&hcan1) != HAL_OK)
+  if (GM6020_Init(&hcan1, &hcan2) != HAL_OK)
   {
     Error_Handler();
   }
   GimbalCalibration_Init();
 
   /*
-   * 初始化 CAN2 底盘发送通道。
-   * 校验 hcan2 为 CAN2 外设 → 启动 CAN2 → 记录时间戳基准。
+   * 初始化 CAN2 底盘发送通道。CAN2 已由 Pitch 电机模块启动时直接复用；
+   * 底盘 0x300/0x301 与 Pitch 0x206/0x1FE 不冲突。
    */
   if (ChassisCAN_Init(&hcan2) != HAL_OK)
   {
@@ -169,6 +172,13 @@ int main(void)
     Error_Handler();
   }
   RemoteGimbalControl_Init();
+
+  /*
+   * BMI088最小通信验证：分别读取加速度计和陀螺仪CHIP_ID。
+   * 读取失败不阻止云台工作，诊断结果由USB CDC周期输出。
+   */
+  (void)BMI088_Init(&hspi1);
+  BMI088_Monitor_Init();
 
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*

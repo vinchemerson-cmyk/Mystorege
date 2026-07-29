@@ -9,8 +9,8 @@
  *   底盘或差速底盘）通过 CAN 接收控制量帧和模式帧来执行运动。
  *
  * 【系统拓扑】
- *   CAN1 → 双轴 GM6020 云台电机（motor_control.c 管理）
- *   CAN2 → 底盘控制器（本模块管理，独立于云台 CAN）
+ *   CAN1 → Yaw GM6020（经滑环连接下板 CAN2）
+ *   CAN2 → Pitch GM6020 + 本模块发送帧（共享物理总线，帧 ID 不同）
  *
  * 【发送协议】
  *   每个控制周期（默认 10 ms）发送两帧标准 CAN 数据帧：
@@ -215,8 +215,8 @@ static HAL_StatusTypeDef chassis_can_send(void)
  * 初始化 CAN2 底盘发送通道。
  *
  * 【执行流程】
- *   1. 校验 hcan 非空且为 CAN2 外设（CAN1 由 motor_control.c 独占）
- *   2. 启动 CAN2 外设
+ *   1. 校验 hcan 非空且为 CAN2 外设
+ *   2. CAN2 未启动时启动；若 Pitch 模块已启动则直接复用
  *   3. 记录句柄和初始时间戳，清除急停锁存
  *
  * 【注意】必须在 MX_CAN2_Init() 之后调用。
@@ -230,10 +230,17 @@ HAL_StatusTypeDef ChassisCAN_Init(CAN_HandleTypeDef *hcan)
     return HAL_ERROR;
   }
 
-  status = HAL_CAN_Start(hcan);
-  if (status != HAL_OK)
+  if (hcan->State == HAL_CAN_STATE_READY)
   {
-    return status;
+    status = HAL_CAN_Start(hcan);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
+  }
+  else if (hcan->State != HAL_CAN_STATE_LISTENING)
+  {
+    return HAL_ERROR;
   }
 
   chassis_can = hcan;

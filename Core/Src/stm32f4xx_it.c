@@ -15,6 +15,16 @@
   *
   ******************************************************************************
   */
+/**
+ * ===========================================================================
+ * @note  本文件由 STM32CubeMX 自动生成，包含所有外设中断服务例程 (ISR)。
+ *        项目自定义 ISR:
+ *          - USART6_IRQHandler   → HAL_UART_IRQHandler (串口调试)
+ *          - CAN1_TX_IRQHandler  → HAL_CAN_IRQHandler (云台 CAN)
+ *          - DMA1_Stream1_IRQHandler → DBUS 接收 DMA
+ *        FreeRTOS 下中断优先级的配置见 FreeRTOSConfig.h
+ * ===========================================================================
+ */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
@@ -22,7 +32,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "usart.h"
+#include "usart.h"     /* USART6 句柄 (huart6) — USART6 handle for debug UART IRQ */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/

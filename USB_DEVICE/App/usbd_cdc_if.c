@@ -21,9 +21,25 @@
 /* Includes ------------------------------------------------------------------*/
 #include "usbd_cdc_if.h"
 
+/**
+ * ===========================================================================
+ * @note  本文件由 STM32CubeMX 自动生成，是 USB CDC 虚拟串口 (Virtual COM Port)
+ *        的接口层实现。
+ *
+ *        【项目集成】
+ *          CDC_Receive_FS() → control_in_receive() 将 USB 收到的数据
+ *          提交给 control_input.c 进行协议解析。
+ *          control_input.c 通过 CDC_Transmit_FS() 将 ACK/反馈帧发送到上位机。
+ *
+ *        【缓冲配置】
+ *          RX Buffer: 2048 字节 (APP_RX_DATA_SIZE)
+ *          TX Buffer: 2048 字节 (APP_TX_DATA_SIZE)
+ *          USB FS 最大包长 64 字节，2048 提供充足余量。
+ * ===========================================================================
+ */
 /* USER CODE BEGIN INCLUDE */
 
-#include "control_input.h"
+#include "control_input.h"   /* 串口协议解析模块 — serial command parser */
 
 /* USER CODE END INCLUDE */
 
