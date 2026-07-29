@@ -64,7 +64,7 @@
 #define PITCH_SPEED_PID_KP              20.0f    /* 比例增益 — 俯仰惯量小，增益可比Yaw高 */
 #define PITCH_SPEED_PID_KI              0.0f     /* 积分增益 — integral gain */
 #define PITCH_SPEED_PID_KD              0.0f     /* 微分增益 — derivative gain */
-#define PITCH_SPEED_PID_OUTPUT_LIMIT    8192.0f  /* 速度环输出限幅 (转矩电流) */
+#define PITCH_SPEED_PID_OUTPUT_LIMIT    10000.0f  /* 速度环输出限幅 (转矩电流) */
 
 /* ---- 角度环 (Angle Loop) ---- */
 #define PITCH_ANGLE_PID_KP              10.0f    /* 比例增益 — proportional gain */
