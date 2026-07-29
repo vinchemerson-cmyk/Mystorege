@@ -18,20 +18,6 @@
   */
 /* USER CODE END Header */
 
-/**
- * ===========================================================================
- * @file    dma.c
- * @brief   DMA 控制器初始化 — DMA1 时钟使能 + 中断配置
- * ===========================================================================
- *
- * 【DMA 用途】
- *   DMA1_Stream1 绑定 USART3_RX，用于 DBUS 遥控器接收机数据接收。
- *   DBUS 协议波特率 100 kbps，18 字节帧，使用 Receive-to-IDLE 模式。
- *
- * 【中断优先级】DMA1_Stream1_IRQn = 0（最高优先级），确保实时接收。
- * ===========================================================================
- */
-
 /* Includes ------------------------------------------------------------------*/
 #include "dma.h"
 
@@ -58,7 +44,7 @@ void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
 
 }

@@ -172,7 +172,8 @@ Q10定点数：
 
 | 路径 | 用途 |
 | --- | --- |
-| `Core/Src/main.c` | 初始化和裸机主循环 |
+| `Core/Src/main.c` | 外设、业务模块及 FreeRTOS 内核初始化 |
+| `Core/Src/freertos.c` | 1 ms 云台控制任务及 RTOS 故障钩子 |
 | `Core/Src/control_input.c` | USB CDC双轴串口指令解析 |
 | `Core/Src/dbus.c` | DBUS DMA接收、摇杆解包、校验与在线判断 |
 | `Core/Src/dbus_monitor.c` | 20 Hz USB CDC遥控器调试输出 |

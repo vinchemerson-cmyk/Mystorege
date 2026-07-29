@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
 #include "usart.h"
@@ -89,6 +90,7 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -131,7 +133,6 @@ int main(void)
   MX_CAN1_Init();
   MX_USART6_UART_Init();
   MX_CAN2_Init();
-  MX_USB_DEVICE_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
@@ -184,6 +185,15 @@ int main(void)
 #endif
   /* USER CODE END 2 */
 
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
@@ -191,55 +201,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-    /*
-     * ┌────────── 主循环调度（裸机循环，无 RTOS） ──────────┐
-     * │                                                      │
-     * │  1. DBUS_Process()        ~每个主循环                 │
-     * │     取出最新18字节帧并解析4通道摇杆和2个开关           │
-     * │     → 范围校验 → 在线状态更新                          │
-     * │                                                      │
-     * │  2. control_in()          ~异步（有数据时才动作）     │
-     * │     解析 USB CDC 收到的双轴位置命令 "yaw,pitch\r\n"  │
-     * │     或紧急命令 "ESTOP\r\n" / "CLEAR\r\n"             │
-     * │     收到有效命令后发送 ACK 回复。                     │
-     * │                                                      │
-     * │  3. GM6020_Process()      ~1 kHz (由电机反馈驱动)     │
-     * │     接收 CAN RX FIFO 中积压的反馈帧                   │
-     * │     → 匹配 StdId (0x205/0x206) → 更新编码器多圈累计  │
-     * │     → 状态机 (WAIT→POSITION/SPEED_DEBUG→FAULT)       │
-     * │     → 角度环 PID → 速度环 PID → 打包 0x1FE 电流帧    │
-     * │                                                      │
-     * │  4. GimbalCalibration_Process()                      │
-     * │     上电采集两轴各100个新的静止反馈并设为机械零点      │
-     * │                                                      │
-     * │  5. RemoteGimbalControl_Process()                    │
-     * │     单轴测试模式下仅CH0积分为Yaw多圈位置目标            │
-     * │     Pitch电流强制为0，掉线/急停/未标定时不更新目标      │
-     * │                                                      │
-     * │  6. control_out()         当前暂停                   │
-     * │     暂停 "FB,..." 周期上报，避免与 DBUS 调试数据混合   │
-     * │                                                      │
-     * │  7. DBUS_Monitor_Process() ~20 Hz (50 ms 周期)        │
-     * │     通过 USB CDC 输出 "RC,..." 遥控器调试数据          │
-     * │                                                      │
-     * │  8. ChassisCAN_Process()  ~100 Hz (10 ms 周期)        │
-     * │     通过 CAN2 发送底盘控制量帧 + 模式帧               │
-     * │                                                      │
-     * │  【执行顺序合理性】                                   │
-     * │   先处理上位机目标 → 再运行电机控制 → 再上报反馈。    │
-     * │   上位机下发命令后，同一轮主循环就能完成闭环：         │
-     * │   命令解析 → PID 计算 → 电流输出 → 反馈上报。         │
-     * └──────────────────────────────────────────────────────┘
-     */
-    DBUS_Process();
-    control_in();
-    GM6020_Process();
-    GimbalCalibration_Process();
-    RemoteGimbalControl_Process();
-    /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 */
-    DBUS_Monitor_Process();
-    ChassisCAN_Process();
+    /* osKernelStart() 成功后不会返回；业务调度位于 freertos.c。 */
   }
   /* USER CODE END 3 */
 }
@@ -292,6 +254,28 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
