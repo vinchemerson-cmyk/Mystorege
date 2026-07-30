@@ -73,7 +73,7 @@
  * 项目自定义模块 (Project custom modules)。
  *   原裸机所有模块在此处包含，RTOS 任务中调度。
  */
-#include "chassis_can.h"         /* CAN2 底盘控制 */
+#include "chassis_can.h"         /* CAN1 底盘控制 */
 #include "bmi088.h"              /* BMI088六轴原始数据采集 */
 #include "bmi088_monitor.h"      /* BMI088 USB诊断与原始数据输出 */
 #include "control_input.h"       /* USB CDC 串口协议 */
@@ -81,6 +81,7 @@
 #include "dbus_monitor.h"        /* DBUS 数据 USB CDC 监视输出 */
 #include "gimbal_calibration.h"  /* 云台零位 Flash 标定 */
 #include "motor_control.h"       /* 双轴 GM6020 电机控制 */
+#include "pitch_fusion.h"        /* Pitch轴 BMI088/编码器融合闭环 */
 #include "remote_gimbal_control.h" /* DBUS 摇杆映射到云台目标 */
 /* USER CODE END Includes */
 
@@ -225,10 +226,11 @@ void StartGimbalTask(void *argument)
    *   2. control_in()                   — 串口命令处理, 有命令时才动作
    *   3. GM6020_Process()              — 电机控制, 与 CAN 反馈同步 (~1 kHz)
    *   4. GimbalCalibration_Process()   — 标定状态机, 空操作除非标定中
-   *   5. RemoteGimbalControl_Process() — 摇杆映射, 每周期积分
-   *   6. BMI088_Monitor_Process()      — 读取快照并输出 (20 ms=50 Hz)
-   *   7. DBUS_Monitor_Process()        — 内部节流 (50 ms=20 Hz)
-   *   8. ChassisCAN_Process()          — 内部节流 (10 ms=100 Hz)
+   *   5. PitchFusion_Process()         — Pitch融合状态与超时维护
+   *   6. RemoteGimbalControl_Process() — 摇杆映射, 每周期积分
+   *   7. BMI088_Monitor_Process()      — 原始/融合数据交替输出
+   *   8. DBUS_Monitor_Process()        — 内部节流 (50 ms=20 Hz)
+   *   9. ChassisCAN_Process()          — 内部节流 (10 ms=100 Hz)
    */
   for(;;)
   {
@@ -236,6 +238,7 @@ void StartGimbalTask(void *argument)
     control_in();
     GM6020_Process();
     GimbalCalibration_Process();
+    PitchFusion_Process();
     RemoteGimbalControl_Process();
     BMI088_Monitor_Process();
     /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 (暂停后可减小 USB 带宽占用) */

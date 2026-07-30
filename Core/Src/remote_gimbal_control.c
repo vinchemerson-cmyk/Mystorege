@@ -1,13 +1,16 @@
 /**
  * ===========================================================================
  * @file    remote_gimbal_control.c
- * @brief   将 DBUS 摇杆量映射为双轴云台位置目标
+ * @brief   将 DBUS 摇杆量映射为云台位置目标和底盘速度目标
  * ===========================================================================
  *
  * 控制方式：
  *   CH0 → Yaw 目标角速度 → 积分得到 Yaw 多圈位置目标
  *   CH1 → Pitch 目标角速度 → 积分得到 Pitch 单圈位置目标
+ *   CH2 → 底盘横移速度 vy
+ *   CH3 → 底盘前进速度 vx
  *   S1上挡 → 云台与底盘急停；S1中/下挡 → 解除急停（临时映射）
+ *   S2上/中/下挡 → 底盘跟随/不跟随/小陀螺模式
  *
  * 每个轴独立检查以下接管条件：
  *   - DBUS 最近100 ms内收到过合法帧；
@@ -26,6 +29,7 @@
 #include "dbus.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
+#include "pitch_fusion.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,6 +38,10 @@
 /* 上板视角：右摇杆横向 CH0 → Yaw，纵向 CH1 → Pitch */
 #define REMOTE_GIMBAL_YAW_CHANNEL          0U    /* Yaw 通道索引 — yaw channel index (CH0) */
 #define REMOTE_GIMBAL_PITCH_CHANNEL        1U    /* Pitch 通道索引 — pitch channel index (CH1) */
+
+/* 左摇杆：横向CH2 → vy，纵向CH3 → vx。 */
+#define REMOTE_CHASSIS_LATERAL_CHANNEL      2U
+#define REMOTE_CHASSIS_FORWARD_CHANNEL      3U
 
 /*
  * ─── 临时S1安全开关映射 (Temporary S1 Safety Mapping) ───
@@ -46,6 +54,7 @@
  */
 #define REMOTE_GIMBAL_TEMP_S1_ESTOP_ENABLE  1U
 #define REMOTE_GIMBAL_S1_INDEX              0U
+#define REMOTE_CHASSIS_MODE_SWITCH_INDEX     1U
 #define REMOTE_GIMBAL_SWITCH_UNKNOWN        0U
 
 /* ─── 摇杆曲线参数 (Joystick Curve Parameters) ─── */
@@ -63,23 +72,32 @@
 
 /* ─── 角速度映射 (Angular Rate Mapping) ─── */
 /* 满杆时对应的云台逻辑目标角速度 (°/s) */
-#define REMOTE_GIMBAL_YAW_MAX_RATE_DPS    360.0f /* Yaw 满杆角速度 — max yaw rate (degrees/sec) */
-#define REMOTE_GIMBAL_PITCH_MAX_RATE_DPS   30.0f /* Pitch 满杆角速度 — max pitch rate (degrees/sec) */
+#define REMOTE_GIMBAL_YAW_MAX_RATE_DPS    180.0f /* Yaw 满杆角速度 — max yaw rate (degrees/sec) */
+#define REMOTE_GIMBAL_PITCH_MAX_RATE_DPS   60.0f /* Pitch 满杆角速度 — max pitch rate (degrees/sec) */
 
 /*
  * 安装方向修正 (Mounting Direction Correction)。
  * 若实机运动方向与遥控器方向相反，只需把对应值改为 -1.0f。
  * 例: 推杆向右 → 云台向左 → 设 YAW_DIRECTION = -1.0f
  */
-#define REMOTE_GIMBAL_YAW_DIRECTION         1.0f  /* Yaw 方向修正 — +1=正向, -1=反向 */
+#define REMOTE_GIMBAL_YAW_DIRECTION        -1.0f  /* Yaw 方向修正 — +1=正向, -1=反向 */
 #define REMOTE_GIMBAL_PITCH_DIRECTION      -1.0f  /* Pitch 安装方向与遥控器相反 */
+
+/*
+ * 底盘速度映射。满杆对应±5.0 m/s，发送模块再转换为Q10原始值±5120。
+ * 当前坐标约定：vx向前为正，vy向左为正。
+ */
+#define REMOTE_CHASSIS_MAX_FORWARD_MPS       5.0f
+#define REMOTE_CHASSIS_MAX_LATERAL_MPS       5.0f
+#define REMOTE_CHASSIS_FORWARD_DIRECTION     1.0f
+#define REMOTE_CHASSIS_LATERAL_DIRECTION    -1.0f
 
 /* ─── 软件限位 (Software Limits) ─── */
 /* 遥控器积分位置目标的软件范围，防止目标角度无限累积溢出 */
 #define REMOTE_GIMBAL_YAW_MIN_DEG      (-36000.0f) /* Yaw 最小角度 — min yaw angle (±100圈) */
 #define REMOTE_GIMBAL_YAW_MAX_DEG        36000.0f  /* Yaw 最大角度 — max yaw angle */
-#define REMOTE_GIMBAL_PITCH_MIN_DEG        -30.0f  /* Pitch 最小角度 — min pitch angle */
-#define REMOTE_GIMBAL_PITCH_MAX_DEG         30.0f  /* Pitch 最大角度 — max pitch angle */
+#define REMOTE_GIMBAL_PITCH_MIN_DEG PITCH_MIN_ANGLE_DEG
+#define REMOTE_GIMBAL_PITCH_MAX_DEG PITCH_MAX_ANGLE_DEG
 
 /*
  * 单次积分时间上限 (Max Integration Delta)。
@@ -100,6 +118,7 @@ typedef struct
   float pitch_target_deg;      /* Pitch 积分目标角度 — integrated pitch target (degrees) */
   uint32_t last_process_ms;    /* 上次处理时间戳 — last process timestamp (ms) */
   bool axis_active[GM6020_AXIS_COUNT]; /* 各轴独立接管激活标志 */
+  bool pitch_fusion_was_ready; /* Pitch反馈源变化时重新锚定遥控目标 */
   uint8_t last_s1_position;    /* 上次S1挡位，用于中/下挡解除沿检测 */
 } RemoteGimbalControlContext_t;
 
@@ -210,6 +229,70 @@ static void process_temporary_s1_safety(
 }
 
 /*
+ * 将左摇杆映射为底盘平移速度。
+ *
+ * DBUS在线且最近帧合法、系统未急停时：
+ *   CH3 → vx，CH2 → vy，wz保持0；
+ *   S2上/中/下 → FOLLOW/NO_FOLLOW/SPIN。
+ *
+ * DBUS掉线、帧非法或急停时提交零速度+SOFTWARE_OFF。若底盘急停已经
+ * 锁存，ChassisCAN_SetCommand()会拒绝普通命令，但急停函数中缓存的
+ * 零速度命令仍会继续周期发送。
+ */
+static void process_chassis_control(
+    const DBUS_Data_t *dbus_data)
+{
+  Chassis_Ctrl_Cmd_s command =
+  {
+    .vx = 0.0f,
+    .vy = 0.0f,
+    .wz = 0.0f,
+    .offset_angle_rad = 0.0f,
+    .chassis_mode = CHASSIS_MODE_SOFTWARE_OFF
+  };
+
+  if ((dbus_data != NULL)
+      && dbus_data->online
+      && dbus_data->last_frame_valid
+      && !GM6020_IsEmergencyStopped())
+  {
+    command.vx =
+        normalize_channel(
+            dbus_data->centered_channel[
+                REMOTE_CHASSIS_FORWARD_CHANNEL])
+        * REMOTE_CHASSIS_FORWARD_DIRECTION
+        * REMOTE_CHASSIS_MAX_FORWARD_MPS;
+    command.vy =
+        normalize_channel(
+            dbus_data->centered_channel[
+                REMOTE_CHASSIS_LATERAL_CHANNEL])
+        * REMOTE_CHASSIS_LATERAL_DIRECTION
+        * REMOTE_CHASSIS_MAX_LATERAL_MPS;
+
+    switch (dbus_data->switch_value[
+        REMOTE_CHASSIS_MODE_SWITCH_INDEX])
+    {
+      case DBUS_SWITCH_UP:
+        command.chassis_mode = CHASSIS_MODE_FOLLOW;
+        break;
+      case DBUS_SWITCH_MIDDLE:
+        command.chassis_mode = CHASSIS_MODE_NO_FOLLOW;
+        break;
+      case DBUS_SWITCH_DOWN:
+        command.chassis_mode = CHASSIS_MODE_SPIN;
+        break;
+      default:
+        command.vx = 0.0f;
+        command.vy = 0.0f;
+        command.chassis_mode = CHASSIS_MODE_SOFTWARE_OFF;
+        break;
+    }
+  }
+
+  (void)ChassisCAN_SetCommand(&command);
+}
+
+/*
  * 判断指定轴是否具备遥控器接管条件。
  *
  * 四个必要条件全部满足才返回true：
@@ -260,6 +343,7 @@ void RemoteGimbalControl_Init(void)
   remote_control.last_process_ms = HAL_GetTick();
   remote_control.axis_active[GM6020_AXIS_YAW] = false;
   remote_control.axis_active[GM6020_AXIS_PITCH] = false;
+  remote_control.pitch_fusion_was_ready = false;
   remote_control.last_s1_position =
       REMOTE_GIMBAL_SWITCH_UNKNOWN;
 }
@@ -288,16 +372,35 @@ void RemoteGimbalControl_Process(void)
   const DBUS_Data_t *dbus_data = DBUS_GetData();
   bool yaw_available;
   bool pitch_available;
+  bool pitch_fusion_ready;
   uint32_t delta_ms;
   float yaw_input;
   float pitch_input;
+  float pitch_feedback_deg;
+  float pitch_feedback_rpm;
 
   process_temporary_s1_safety(dbus_data);
+  process_chassis_control(dbus_data);
 
   yaw_available = remote_axis_is_available(
       dbus_data, GM6020_AXIS_YAW);
   pitch_available = remote_axis_is_available(
       dbus_data, GM6020_AXIS_PITCH);
+  pitch_fusion_ready = PitchFusion_GetControlFeedback(
+      &pitch_feedback_deg,
+      &pitch_feedback_rpm);
+
+  /*
+   * 编码器与融合反馈相互切换时，旧遥控积分目标属于旧参考系。
+   * 强制Pitch轴下一步从新反馈当前位置重新接管，避免恢复旧运动。
+   */
+  if (pitch_fusion_ready
+      != remote_control.pitch_fusion_was_ready)
+  {
+    remote_control.axis_active[GM6020_AXIS_PITCH] = false;
+    remote_control.pitch_fusion_was_ready =
+        pitch_fusion_ready;
+  }
 
   if (!yaw_available)
   {
@@ -359,9 +462,21 @@ void RemoteGimbalControl_Process(void)
   {
     if (!remote_control.axis_active[GM6020_AXIS_PITCH])
     {
-      if (GM6020_GetMultiTurnPosition(
-              GM6020_AXIS_PITCH,
-              &remote_control.pitch_target_deg))
+      bool position_available = pitch_fusion_ready;
+
+      if (pitch_fusion_ready)
+      {
+        remote_control.pitch_target_deg =
+            pitch_feedback_deg;
+      }
+      else
+      {
+        position_available = GM6020_GetMultiTurnPosition(
+            GM6020_AXIS_PITCH,
+            &remote_control.pitch_target_deg);
+      }
+
+      if (position_available)
       {
         remote_control.axis_active[GM6020_AXIS_PITCH] = true;
         GM6020_SetTargetPosition(

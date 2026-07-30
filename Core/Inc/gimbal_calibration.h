@@ -16,7 +16,8 @@ typedef enum
   GIMBAL_CALIBRATION_WAITING_STILL,
   GIMBAL_CALIBRATION_SAMPLING,
   GIMBAL_CALIBRATION_CALIBRATED,
-  GIMBAL_CALIBRATION_ERROR
+  GIMBAL_CALIBRATION_ERROR,
+  GIMBAL_CALIBRATION_RETURNING_ZERO
 } GimbalCalibrationStatus_t;
 
 /*
@@ -26,7 +27,9 @@ typedef enum
 void GimbalCalibration_Init(void);
 
 /*
- * 两轴分别采集100个新的静止反馈，把各自开机姿态设置为机械零点。
+ * Yaw采集100个静止编码器反馈，把开机姿态设置为机械零点。
+ * Pitch同步采集100个编码器反馈和IMU重力角，把传感器水平定义为逻辑0°，
+ * 随后使用位置环斜坡目标缓慢回到该零点。
  * 任一轴可在另一轴离线时独立完成标定。
  */
 void GimbalCalibration_Process(void);

@@ -5,12 +5,12 @@
  * ===========================================================================
  *
  * 【模块功能】
- *   本模块负责通过 CAN2 总线向底盘发送运动控制指令。底盘（例如麦克纳姆轮
+ *   本模块负责通过 CAN1 总线向底盘发送运动控制指令。底盘（例如麦克纳姆轮
  *   底盘或差速底盘）通过 CAN 接收控制量帧和模式帧来执行运动。
  *
  * 【系统拓扑】
- *   CAN1 → Yaw GM6020（经滑环连接下板 CAN2）
- *   CAN2 → Pitch GM6020 + 本模块发送帧（共享物理总线，帧 ID 不同）
+ *   CAN1 → Yaw GM6020 + 本模块发送帧（共享物理总线，帧 ID 不同）
+ *   CAN2 → Pitch GM6020
  *
  * 【发送协议】
  *   每个控制周期（默认 10 ms）发送两帧标准 CAN 数据帧：
@@ -43,7 +43,7 @@
  *
  * 【数据流】
  *   外部调用 ChassisCAN_SetCommand() → 更新 chassis_command →
- *   ChassisCAN_Process() 按周期发送 → CAN2 总线上底盘接收
+ *   ChassisCAN_Process() 按周期发送 → CAN1 总线上底盘接收
  *
  * 【依赖】
  *   - config/chassis_can_config.h   CAN ID、Q10 缩放因子、发送周期等配置
@@ -77,12 +77,12 @@
 
 /* ---- 模块级静态变量 ---- */
 
-/* CAN2 句柄，由 ChassisCAN_Init() 赋值，ChassisCAN_Process() 使用 */
+/* CAN1 句柄，由 ChassisCAN_Init() 赋值，ChassisCAN_Process() 使用 */
 static CAN_HandleTypeDef *chassis_can;
 
 /*
  * 下一周期待发送的底盘控制命令缓存。
- * 初始值：零速度、跟随模式。
+ * 初始值：零速度、软件断电。收到合法DBUS命令后才切换到跟随模式。
  * 通过 ChassisCAN_SetCommand() 更新。
  */
 static Chassis_Ctrl_Cmd_s chassis_command =
@@ -91,7 +91,7 @@ static Chassis_Ctrl_Cmd_s chassis_command =
   .vy                = 0.0f,               /* 横移速度 (m/s) —— lateral velocity  */
   .wz                = 0.0f,               /* 旋转速度 (rad/s) —— angular velocity */
   .offset_angle_rad  = 0.0f,               /* 偏移角 (rad) —— offset angle in radians */
-  .chassis_mode      = CHASSIS_MODE_FOLLOW  /* 底盘模式 —— chassis control mode */
+  .chassis_mode      = CHASSIS_MODE_SOFTWARE_OFF /* 无遥控数据时保持软件断电 */
 };
 
 /* 上一次成功发送的时间戳 (ms)，用于周期节流 */
@@ -212,20 +212,20 @@ static HAL_StatusTypeDef chassis_can_send(void)
 }
 
 /*
- * 初始化 CAN2 底盘发送通道。
+ * 初始化 CAN1 底盘发送通道。
  *
  * 【执行流程】
- *   1. 校验 hcan 非空且为 CAN2 外设
- *   2. CAN2 未启动时启动；若 Pitch 模块已启动则直接复用
+ *   1. 校验 hcan 非空且为 CAN1 外设
+ *   2. CAN1 未启动时启动；若 Yaw 模块已启动则直接复用
  *   3. 记录句柄和初始时间戳，清除急停锁存
  *
- * 【注意】必须在 MX_CAN2_Init() 之后调用。
+ * 【注意】必须在 MX_CAN1_Init() 之后调用。
  */
 HAL_StatusTypeDef ChassisCAN_Init(CAN_HandleTypeDef *hcan)
 {
   HAL_StatusTypeDef status;
 
-  if ((hcan == NULL) || (hcan->Instance != CAN2))
+  if ((hcan == NULL) || (hcan->Instance != CAN1))
   {
     return HAL_ERROR;
   }

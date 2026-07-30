@@ -27,7 +27,7 @@
  *     "<Yaw角度>,<Pitch角度>\r\n"  — 设置双轴目标角度
  *       例: "123.45,-15.30\r\n"    — Yaw 123.45°, Pitch -15.30°
  *         Yaw 范围:  ±36000° (累计多圈)
- *         Pitch 范围: ±30° (单圈位置)
+ *         Pitch 范围: -31.0°~+18.5° (单圈位置)
  *     "ESTOP\r\n"                  — 锁存式急停（不区分大小写）
  *     "CLEAR\r\n"                  — 解除急停（严格区分大小写）
  *     "CALSTATUS\r\n"              — 查询上电自动标定状态（可选）
@@ -38,8 +38,8 @@
  *     "ESTOPPED\r\n" — 已执行急停
  *     "CLEARED\r\n"  — 已解除急停
  *     "LOCKED\r\n"   — 急停锁存中，拒绝角度命令
- *     "CALIBRATING\r\n" / "CALIBRATED\r\n" / "CALWAIT\r\n"
- *     / "CALMOVING\r\n" / "CALERROR\r\n"
+ *     "CALIBRATING\r\n" / "CALHOMING\r\n" / "CALIBRATED\r\n"
+ *     / "CALWAIT\r\n" / "CALMOVING\r\n" / "CALERROR\r\n"
  *                    — 零位标定状态
  *     "FB,<yaw_deg>,<pitch_deg>,<yaw_rpm>,<pitch_rpm>,<yaw_online>,<pitch_online>,<estop>\r\n"
  *                    — 周期反馈帧 (~1 Hz)
@@ -54,6 +54,7 @@
 #include "control_input.h"
 
 #include "chassis_can.h"
+#include "config/gimbal_params.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
 #include "usbd_cdc_if.h"
@@ -85,9 +86,9 @@
 #define CONTROL_IN_YAW_MIN_DEG    (-36000.0f)  /* Yaw 最小角度目标 — minimum yaw angle */
 #define CONTROL_IN_YAW_MAX_DEG      36000.0f   /* Yaw 最大角度目标 — maximum yaw angle */
 
-/* Pitch 俯仰角度范围：±30°，受机械结构限制（线材干涉、重心偏置） */
-#define CONTROL_IN_PITCH_MIN_DEG  (-30.0f)  /* Pitch 最小角度目标 — minimum pitch angle */
-#define CONTROL_IN_PITCH_MAX_DEG    30.0f   /* Pitch 最大角度目标 — maximum pitch angle */
+/* Pitch命令与电机层共用同一组实测运行软限位，避免配置漂移。 */
+#define CONTROL_IN_PITCH_MIN_DEG PITCH_MIN_ANGLE_DEG
+#define CONTROL_IN_PITCH_MAX_DEG PITCH_MAX_ANGLE_DEG
 
 /*
  * 命令响应确认枚举 (Control Acknowledgment Enum)。
@@ -102,10 +103,11 @@ typedef enum
   CONTROL_ACK_CLEARED,       /* 急停已解除 "CLEARED\r\n" */
   CONTROL_ACK_LOCKED,        /* 急停锁存中，拒绝命令 "LOCKED\r\n" */
   CONTROL_ACK_CALIBRATING,   /* 正在采集标定样本 */
+  CONTROL_ACK_CALHOMING,     /* Pitch正在缓慢回传感器零点 */
   CONTROL_ACK_CALIBRATED,    /* 上电自动标定已完成 */
   CONTROL_ACK_CALWAIT,       /* 至少一个未标定轴正在等待有效反馈 */
   CONTROL_ACK_CALMOVING,     /* 云台未静止，样本已重置 */
-  CONTROL_ACK_CALERROR       /* 运行时应用零位失败 */
+  CONTROL_ACK_CALERROR       /* 标定或回零安全检查失败 */
 } ControlAck_t;
 
 /*
@@ -133,6 +135,7 @@ static uint8_t estopped_reply[] = "ESTOPPED\r\n"; /* 已急停 */
 static uint8_t cleared_reply[] = "CLEARED\r\n";   /* 已清除 */
 static uint8_t locked_reply[]  = "LOCKED\r\n";    /* 锁存拒绝 */
 static uint8_t calibrating_reply[] = "CALIBRATING\r\n";
+static uint8_t calibration_homing_reply[] = "CALHOMING\r\n";
 static uint8_t calibrated_reply[] = "CALIBRATED\r\n";
 static uint8_t calibration_wait_reply[] = "CALWAIT\r\n";
 static uint8_t calibration_moving_reply[] = "CALMOVING\r\n";
@@ -370,6 +373,12 @@ static void transmit_pending_ack(void)
     result = CDC_Transmit_FS(
         calibrating_reply, sizeof(calibrating_reply) - 1U);
   }
+  else if (pending_ack == CONTROL_ACK_CALHOMING)
+  {
+    result = CDC_Transmit_FS(
+        calibration_homing_reply,
+        sizeof(calibration_homing_reply) - 1U);
+  }
   else if (pending_ack == CONTROL_ACK_CALIBRATED)
   {
     result = CDC_Transmit_FS(
@@ -484,6 +493,10 @@ void control_in(void)
 
       case GIMBAL_CALIBRATION_SAMPLING:
         pending_ack = CONTROL_ACK_CALIBRATING;
+        break;
+
+      case GIMBAL_CALIBRATION_RETURNING_ZERO:
+        pending_ack = CONTROL_ACK_CALHOMING;
         break;
 
       case GIMBAL_CALIBRATION_ERROR:

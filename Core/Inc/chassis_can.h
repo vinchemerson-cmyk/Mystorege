@@ -5,15 +5,15 @@
  * ===========================================================================
  *
  * 【模块职责】
- *   通过 CAN2 总线向底盘控制器周期发送运动指令（控制量 + 模式）。
- *   与 motor_control.h (CAN1 云台控制) 是独立的 CAN 总线子系统。
+ *   通过 CAN1 总线向底盘控制器周期发送运动指令（控制量 + 模式）。
+ *   与Yaw GM6020共享CAN1物理总线，但使用不同标准帧ID。
  *
  * 【数据类型】
  *   chassis_mode_e     底盘控制模式枚举（断电/跟随/非跟随/自旋）
  *   Chassis_Ctrl_Cmd_s 底盘控制命令结构体（vx/vy/wz/offset_angle_rad + 模式）
  *
  * 【对外 API】
- *   ChassisCAN_Init()            启动 CAN2 发送通道
+ *   ChassisCAN_Init()            启动 CAN1 发送通道
  *   ChassisCAN_SetCommand()      更新待发送命令
  *   ChassisCAN_EmergencyStop()   锁存式急停
  *   ChassisCAN_ClearEmergencyStop() 解除急停
@@ -60,7 +60,7 @@ typedef struct
   chassis_mode_e chassis_mode; /* 底盘控制模式 — chassis operation mode */
 } Chassis_Ctrl_Cmd_s;
 
-/* 启动CAN2底盘发送。 */
+/* 启动CAN1底盘发送。 */
 HAL_StatusTypeDef ChassisCAN_Init(CAN_HandleTypeDef *hcan);
 
 /* 更新下一周期要发送的底盘命令。 */

@@ -56,23 +56,23 @@
 #define YAW_SPEED_PID_OUTPUT_LIMIT      10000.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
 
 /* ---- 角度环 (Angle Loop / Outer Loop) ---- */
-#define YAW_ANGLE_PID_KP                40.0f    /* 比例增益 — proportional gain */
-#define YAW_ANGLE_PID_KI                5.0f     /* 积分增益 — integral gain */
+#define YAW_ANGLE_PID_KP                35.0f    /* 比例增益 — proportional gain */
+#define YAW_ANGLE_PID_KI                10.0f     /* 积分增益 — integral gain */
 #define YAW_ANGLE_PID_KD                0.0f     /* 微分增益 — derivative gain */
 #define YAW_ANGLE_SPEED_LIMIT_RPM       200.0f   /* 角度环输出限幅 (目标转速上限 rpm) */
 
 /*===================== Pitch 轴 PID 参数 (Pitch Axis PID Parameters) =====================*/
 /* ---- 速度环 (Speed Loop) ---- */
 #define PITCH_SPEED_PID_KP              40.0f    /* 第一阶段增力测试：由20提高到40 */
-#define PITCH_SPEED_PID_KI              0.0f     /* 积分增益 — integral gain */
+#define PITCH_SPEED_PID_KI              10.0f     /* 积分增益 — integral gain */
 #define PITCH_SPEED_PID_KD              0.0f     /* 微分增益 — derivative gain */
 #define PITCH_SPEED_PID_OUTPUT_LIMIT    8192.0f  /* 速度环输出限幅 (转矩电流) */
 
 /* ---- 角度环 (Angle Loop) ---- */
-#define PITCH_ANGLE_PID_KP              20.0f    /* 比例增益 — proportional gain */
+#define PITCH_ANGLE_PID_KP              40.0f    /* 比例增益 — proportional gain */
 #define PITCH_ANGLE_PID_KI              0.0f     /* 积分增益 — integral gain */
 #define PITCH_ANGLE_PID_KD              0.0f     /* 微分增益 — derivative gain */
-#define PITCH_ANGLE_SPEED_LIMIT_RPM     100.0f   /* 角度环输出限幅 — 俯仰轴需更保守 */
+#define PITCH_ANGLE_SPEED_LIMIT_RPM     150.0f   /* 角度环输出限幅 — 俯仰轴需更保守 */
 
 /*===================== Yaw 轴机械参数 (Yaw Axis Mechanical Parameters) ====================*/
 /*
@@ -97,12 +97,16 @@
 #define PITCH_ZERO_OFFSET_DEG           0.0f     /* 零位偏置 — zero position offset (degrees) */
 
 /*
- * 当前需求只指定 Yaw 限位，因此 Pitch 默认关闭。
- * 确定俯仰机械范围后可改为 1U，并填写上下限。
+ * 实测传感器零点编码器值为982，机械端点为：
+ *   朝上203  → -34.23°
+ *   朝下1480 → +21.88°
+ *
+ * 运行限位分别向机械范围内缩约3.2°~3.4°。受当前电机安装方向影响，
+ * 负角度对应抬头、正角度对应低头。
  */
 #define PITCH_ANGLE_LIMIT_ENABLE        1U       /* 软限位使能 — 0=关闭, 1=开启 */
-#define PITCH_MIN_ANGLE_DEG            (-30.0f)  /* 最小俯仰角度 — 低头 (look down) */
-#define PITCH_MAX_ANGLE_DEG             30.0f    /* 最大俯仰角度 — 抬头 (look up) */
+#define PITCH_MIN_ANGLE_DEG            (-31.0f)  /* 最小俯仰角度 — 抬头 (look up) */
+#define PITCH_MAX_ANGLE_DEG             18.5f    /* 最大俯仰角度 — 低头 (look down) */
 
 /*===================== 公共安全参数 (Common Safety Parameters) =====================*/
 /*

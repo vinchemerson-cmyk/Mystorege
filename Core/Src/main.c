@@ -30,7 +30,7 @@
 /* USER CODE BEGIN Includes */
 /*
  * 项目自定义模块：
- *   chassis_can.h  — CAN2 底盘控制命令发送 (Chassis CAN2 command transmission)
+ *   chassis_can.h  — CAN1 底盘控制命令发送 (Chassis CAN1 command transmission)
  *   control_input.h — USB CDC 双轴串口控制入口 (USB CDC serial control interface)
  *   dbus_monitor.h — DBUS 数据 USB CDC 调试输出
  *   gimbal_calibration.h — 双轴上电自动机械零位采样
@@ -45,6 +45,7 @@
 #include "dbus_monitor.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
+#include "pitch_fusion.h"
 #include "remote_gimbal_control.h"
 /* USER CODE END Includes */
 
@@ -155,10 +156,10 @@ int main(void)
   GimbalCalibration_Init();
 
   /*
-   * 初始化 CAN2 底盘发送通道。CAN2 已由 Pitch 电机模块启动时直接复用；
-   * 底盘 0x300/0x301 与 Pitch 0x206/0x1FE 不冲突。
+   * 初始化 CAN1 底盘发送通道。CAN1 已由 Yaw 电机模块启动时直接复用；
+   * 底盘 0x300/0x301 与 Yaw 0x206/0x1FE 不冲突。
    */
-  if (ChassisCAN_Init(&hcan2) != HAL_OK)
+  if (ChassisCAN_Init(&hcan1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -176,8 +177,9 @@ int main(void)
   /*
    * BMI088最小通信验证：分别读取加速度计和陀螺仪CHIP_ID。
    * 读取失败不阻止云台工作，诊断结果由USB CDC周期输出。
-   */
+  */
   (void)BMI088_Init(&hspi1);
+  PitchFusion_Init();
   BMI088_Monitor_Init();
 
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE

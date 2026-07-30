@@ -173,7 +173,9 @@ bool GM6020_SetAxisZeroOffsetEcd(GM6020_Axis_t axis,
  *
  * target_angle_deg 为相对配置零位的逻辑角度（度）。
  * 函数内部执行顺序：
- *   1. 若有软限位（angle_limit_enabled），将目标限幅到 [min, max]
+ *   1. 若有软限位（angle_limit_enabled），正常位置将目标限幅到
+ *      [min, max]；若当前位置已在限位外，只允许保持当前位置或向
+ *      正常范围内恢复，不允许命令继续向外运动
  *   2. 叠加零位偏置 zero_offset_deg，归一化到 [0, 360)
  *   3. 若已处于 POSITION_CONTROL 状态，按劣弧方向解析为多圈目标；
  *      否则等状态转移时再解析
