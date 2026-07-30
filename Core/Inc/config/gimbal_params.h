@@ -50,16 +50,31 @@
 
 /*======================= Yaw 轴 PID 参数 (Yaw Axis PID Parameters) =======================*/
 /* ---- 速度环 (Speed Loop / Inner Loop) ---- */
-#define YAW_SPEED_PID_KP                40.0f    /* 比例增益 — proportional gain */
-#define YAW_SPEED_PID_KI                12.0f     /* 积分增益 — integral gain */
+#define YAW_SPEED_PID_KP                90.0f    /* 比例增益 — proportional gain */
+#define YAW_SPEED_PID_KI                35.0f     /* 积分增益 — integral gain */
 #define YAW_SPEED_PID_KD                0.0f     /* 微分增益 — derivative gain */
-#define YAW_SPEED_PID_OUTPUT_LIMIT      10000.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
+#define YAW_SPEED_PID_OUTPUT_LIMIT      14000.0f  /* 速度环输出限幅 (转矩电流, ±8192 ≈ ±1.5A) */
 
 /* ---- 角度环 (Angle Loop / Outer Loop) ---- */
-#define YAW_ANGLE_PID_KP                35.0f    /* 比例增益 — proportional gain */
-#define YAW_ANGLE_PID_KI                10.0f     /* 积分增益 — integral gain */
+#define YAW_ANGLE_PID_KP                70.0f    /* 比例增益 — proportional gain */
+#define YAW_ANGLE_PID_KI                25.0f     /* 积分增益 — integral gain */
 #define YAW_ANGLE_PID_KD                0.0f     /* 微分增益 — derivative gain */
 #define YAW_ANGLE_SPEED_LIMIT_RPM       200.0f   /* 角度环输出限幅 (目标转速上限 rpm) */
+
+/*
+ * ---- Yaw前馈 ----
+ * 遥控目标本身由角速度积分得到，因此目标速度前馈可直接启用。
+ * 其余模型系数必须使用实机日志辨识，默认保持0。
+ */
+#define YAW_TARGET_RATE_FF_GAIN           1.0f
+#define YAW_BASE_RATE_FF_GAIN              0.0f
+#define YAW_GRAVITY_SIN_FF_CURRENT         0.0f
+#define YAW_GRAVITY_COS_FF_CURRENT         0.0f
+#define YAW_GRAVITY_BIAS_FF_CURRENT        0.0f
+#define YAW_STATIC_FRICTION_FF_CURRENT     0.0f
+#define YAW_VELOCITY_FF_CURRENT_PER_RPM    0.0f
+#define YAW_ACCEL_FF_CURRENT_PER_RPM_S     0.0f
+#define YAW_FEEDFORWARD_CURRENT_LIMIT   2000.0f
 
 /*===================== Pitch 轴 PID 参数 (Pitch Axis PID Parameters) =====================*/
 /* ---- 速度环 (Speed Loop) ---- */
@@ -73,6 +88,25 @@
 #define PITCH_ANGLE_PID_KI              0.0f     /* 积分增益 — integral gain */
 #define PITCH_ANGLE_PID_KD              0.0f     /* 微分增益 — derivative gain */
 #define PITCH_ANGLE_SPEED_LIMIT_RPM     150.0f   /* 角度环输出限幅 — 俯仰轴需更保守 */
+
+/*
+ * ---- Pitch前馈 ----
+ * TARGET_RATE可以安全地使用遥控轨迹速度。重力、摩擦、速度和加速度
+ * 电流系数必须先架空电机采集数据，再逐项填写；未知系数禁止猜测。
+ *
+ * 重力模型：
+ *   current = SIN*sin(angle) + COS*cos(angle) + BIAS
+ * 该形式不要求提前确定Pitch逻辑0°对应水平还是竖直。
+ */
+#define PITCH_TARGET_RATE_FF_GAIN         0.25f
+#define PITCH_BASE_RATE_FF_GAIN            0.0f
+#define PITCH_GRAVITY_SIN_FF_CURRENT       0.0f
+#define PITCH_GRAVITY_COS_FF_CURRENT       0.0f
+#define PITCH_GRAVITY_BIAS_FF_CURRENT      0.0f
+#define PITCH_STATIC_FRICTION_FF_CURRENT   0.0f
+#define PITCH_VELOCITY_FF_CURRENT_PER_RPM  0.0f
+#define PITCH_ACCEL_FF_CURRENT_PER_RPM_S   0.0f
+#define PITCH_FEEDFORWARD_CURRENT_LIMIT 2000.0f
 
 /*===================== Yaw 轴机械参数 (Yaw Axis Mechanical Parameters) ====================*/
 /*
@@ -111,15 +145,26 @@
 /*===================== 公共安全参数 (Common Safety Parameters) =====================*/
 /*
  * Yaw 单轴装机测试模式：
- *   1 = 禁止Pitch遥控并强制0x1FE的Pitch电流槽为0；
+ *   1 = CH0直接映射为Yaw目标转速，只运行速度环；
+ *       同时禁止Pitch遥控并强制0x1FE的Pitch电流槽为0；
  *   0 = 启用Yaw和Pitch逐轴独立标定、在线检查及遥控控制。
  */
 #define GIMBAL_YAW_ONLY_TEST_MODE       0U
+
+/*
+ * Yaw单轴速度环调试时的遥控器满杆目标转速。
+ * 电机控制层仍会执行GM6020_DEBUG_SPEED_LIMIT_RPM硬限幅。
+ */
+#define YAW_REMOTE_SPEED_DEBUG_MAX_RPM  100.0f
 
 /* 反馈超时阈值：100ms 内未收到有效 CAN 反馈 → FAULT 状态 → 输出零电流 */
 #define GM6020_FEEDBACK_TIMEOUT_MS      100U     /* 反馈超时 — feedback timeout (ms) */
 
 /* 速度调试模式转速硬限幅：±200 RPM (GM6020 额定转速约 300 RPM) */
 #define GM6020_DEBUG_SPEED_LIMIT_RPM    200.0f   /* 调试转速上限 — debug speed limit (rpm) */
+
+/* 位置轨迹前馈接口的公共安全限制。 */
+#define GM6020_POSITION_FF_ACCEL_LIMIT_RPM_S 2000.0f
+#define GM6020_FRICTION_TRANSITION_RPM          1.0f
 
 #endif /* GIMBAL_PARAMS_H */

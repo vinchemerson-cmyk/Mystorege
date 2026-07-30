@@ -11,6 +11,7 @@
  *     IMU_RAW,<sample_count>,<ax>,<ay>,<az>,<gx>,<gy>,<gz>,<temp_milli_c>,<read_errors>\r\n
  *     PITCH_FUSION,S=<state>,CAL=<count>,AR=<cdeg>,AA=<cdeg>,G=<cdps>,
  *       E=<cdeg>,ER=<cdps>,F=<cdeg>,FR=<cdps>,B=<cdps>,I=<cdeg>,
+ *       GB=<cdps>,TC=<current>,CMD=<current>,FF=<current>,
  *       R=<count>,H=<imu><motor><accel>\r\n
  *     - 总发送周期: 20 ms；两种行各约 25 Hz
  *     - accel_raw: 16-bit 原始值, gyro_raw: 16-bit 原始值
@@ -35,6 +36,7 @@
 #include "bmi088_monitor.h"
 
 #include "bmi088.h"
+#include "motor_control.h"
 #include "pitch_fusion.h"
 #include "stm32f4xx_hal.h"
 #include "usbd_cdc_if.h"
@@ -129,13 +131,18 @@ void BMI088_Monitor_Process(void)
     {
       const PitchFusionData_t *fusion =
           PitchFusion_GetData();
+      const GM6020_Feedback_t *pitch_feedback =
+          GM6020_GetFeedback(GM6020_AXIS_PITCH);
+      const GM6020_SpeedDebugData_t pitch_control =
+          GM6020_GetSpeedDebugData(GM6020_AXIS_PITCH);
 
       length = snprintf(
           (char *)monitor_buffer,
           sizeof(monitor_buffer),
           "PITCH_FUSION,S=%u,CAL=%u,"
           "AR=%ld,AA=%ld,G=%ld,E=%ld,ER=%ld,"
-          "F=%ld,FR=%ld,B=%ld,I=%ld,R=%u,H=%u%u%u\r\n",
+          "F=%ld,FR=%ld,B=%ld,I=%ld,GB=%ld,"
+          "TC=%d,CMD=%ld,FF=%ld,R=%u,H=%u%u%u\r\n",
           (unsigned int)fusion->status,
           (unsigned int)fusion->calibration_sample_count,
           (long)monitor_float_to_centi(
@@ -156,6 +163,13 @@ void BMI088_Monitor_Process(void)
               fusion->base_disturbance_rate_dps),
           (long)monitor_float_to_centi(
               fusion->accel_innovation_deg),
+          (long)monitor_float_to_centi(
+              fusion->gyro_bias_dps),
+          (pitch_feedback != NULL)
+              ? (int)pitch_feedback->torque_current
+              : 0,
+          (long)pitch_control.output_current,
+          (long)pitch_control.current_feedforward,
           (unsigned int)fusion->recovery_sample_count,
           fusion->imu_valid ? 1U : 0U,
           fusion->motor_valid ? 1U : 0U,

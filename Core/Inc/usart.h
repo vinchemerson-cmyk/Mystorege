@@ -19,12 +19,12 @@
 /**
  * ===========================================================================
  * @file    usart.h
- * @brief   USART6 硬件初始化 — MX_USART6_UART_Init() 声明与句柄 extern
+ * @brief   USART3/USART6 硬件初始化与句柄声明
  * ===========================================================================
  *
- * USART6 配置为 115200-8-N-1，用于调试输出。
- * GPIO: PG9=RX, PG14=TX (复用 AF8)。
- * 与 USB CDC 虚拟串口独立（USB 用于上位机协议，USART6 用于调试终端）。
+ * USART3: 100000-8-E-1，DBUS接收。
+ * USART6: 460800-8-N-1，PG14=TX、PG9=RX，TX使用DMA2 Stream6。
+ *         在开发板C型外壳上对应丝印“UART1”的3-pin接口。
  * ===========================================================================
  */
 /* USER CODE END Header */
@@ -46,6 +46,7 @@ extern "C" {
 extern UART_HandleTypeDef huart3;
 
 extern UART_HandleTypeDef huart6;
+extern DMA_HandleTypeDef hdma_usart6_tx;
 
 /* USER CODE BEGIN Private defines */
 

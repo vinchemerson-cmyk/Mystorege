@@ -28,7 +28,8 @@
  *   安全:      GM6020_EmergencyStop(), GM6020_ClearEmergencyStop(),
  *              GM6020_IsEmergencyStopped()
  *   查询:      GM6020_GetFeedback(), GM6020_GetMultiTurnPosition(),
- *              GM6020_GetControlMode(), GM6020_GetSpeedDebugData()
+ *              GM6020_GetTargetPosition(), GM6020_GetControlMode(),
+ *              GM6020_GetSpeedDebugData()
  *   主循环:    GM6020_Process()
  *
  * 【依赖】
@@ -112,6 +113,9 @@ typedef struct
   float feedback_speed_rpm;   /* 电机反馈转速 — feedback speed (rpm) */
   float speed_error_rpm;      /* 转速误差 — speed error = target - feedback */
   float output_current;       /* 速度环 PID 输出的转矩电流值 — output torque current */
+  int16_t command_current;     /* 限幅后实际写入CAN控制帧的电流命令 */
+  float speed_feedforward_rpm;/* 角度环叠加的目标速度前馈 */
+  float current_feedforward;  /* 速度环叠加的模型电流前馈 */
   float kp;                   /* 当前使用的比例增益 — current proportional gain (Kp) */
   float ki;                   /* 当前使用的积分增益 — current integral gain (Ki) */
   float kd;                   /* 当前使用的微分增益 — current derivative gain (Kd) */
@@ -213,6 +217,18 @@ void GM6020_SetGimbalPosition(float yaw_angle_deg,
                               float pitch_angle_deg);
 
 /*
+ * 为位置控制提交轨迹前馈。
+ *
+ * target_speed_rpm是位置目标的一阶导数，target_acceleration_rpm_s是
+ * 二阶导数。接口只缓存并限幅前馈，不改变位置目标；急停、故障、反馈源
+ * 切换和速度调试模式会自动清零。没有可靠加速度轨迹时传0。
+ */
+void GM6020_SetPositionFeedforward(
+    GM6020_Axis_t axis,
+    float target_speed_rpm,
+    float target_acceleration_rpm_s);
+
+/*
  * ======================== 速度环调试接口 ========================
  *
  * 速度调试模式绕过角度环，直接用指定 RPM 驱动速度环。
@@ -289,6 +305,16 @@ const GM6020_Feedback_t *GM6020_GetFeedback(GM6020_Axis_t axis);
  * 编码器尚未初始化或参数无效时返回 false。
  */
 bool GM6020_GetMultiTurnPosition(
+    GM6020_Axis_t axis,
+    float *position_deg);
+
+/*
+ * 获取位置环当前实际使用的理论位置目标。
+ *
+ * 只有该轴反馈在线、坐标已初始化、未急停且正在位置控制时返回 true。
+ * 纯速度环没有位置目标，因此返回 false。
+ */
+bool GM6020_GetTargetPosition(
     GM6020_Axis_t axis,
     float *position_deg);
 

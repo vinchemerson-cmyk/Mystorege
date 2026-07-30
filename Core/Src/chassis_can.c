@@ -280,6 +280,29 @@ bool ChassisCAN_SetCommand(const Chassis_Ctrl_Cmd_s *command)
   return true;
 }
 
+bool ChassisCAN_GetCommand(Chassis_Ctrl_Cmd_s *command)
+{
+  uint32_t primask;
+
+  if (command == NULL)
+  {
+    return false;
+  }
+
+  /*
+   * 命令由高优先级云台任务更新，调试任务读取。短暂屏蔽中断完成一致快照，
+   * 防止读取五个字段期间发生任务切换。
+   */
+  primask = __get_PRIMASK();
+  __disable_irq();
+  *command = chassis_command;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+  return true;
+}
+
 /*
  * 锁存式急停：立即发送零速度 + 软件断电模式，并阻止后续普通命令。
  *
@@ -318,6 +341,11 @@ HAL_StatusTypeDef ChassisCAN_EmergencyStop(void)
 void ChassisCAN_ClearEmergencyStop(void)
 {
   emergency_stop_latched = false;
+}
+
+bool ChassisCAN_IsEmergencyStopped(void)
+{
+  return emergency_stop_latched;
 }
 
 /*

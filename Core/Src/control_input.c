@@ -7,7 +7,7 @@
  * 【模块定位】
  *   本模块是上位机与 MCU 之间的串口协议层，负责：
  *     输入 (control_in):  解析上位机下发的角度目标命令或急停命令，
- *                          并分发给 motor_control.c 和 chassis_can.c
+ *                          并分发给云台、底盘和拨弹盘模块
  *     输出 (control_out): 周期上报双轴角度、转速、在线状态和急停状态
  *
  * 【串口拓扑】
@@ -55,6 +55,8 @@
 
 #include "chassis_can.h"
 #include "config/gimbal_params.h"
+#include "dual_m3508.h"
+#include "feeder_motor.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
 #include "usbd_cdc_if.h"
@@ -420,8 +422,8 @@ static void transmit_pending_ack(void)
  *   1. 重发上次未成功发送的 ACK（USB 可能当时忙）
  *   2. 在临界区中读取 pending_line 和 pending_emergency_stop 标志
  *   3. 优先级处理：
- *      a) 急停请求 → GM6020 + ChassisCAN 同时急停 → 回复 ESTOPPED
- *      b) CLEAR 命令 → 清除双模块急停 → 回复 CLEARED
+ *      a) 急停请求 → GM6020 + ChassisCAN + Feeder同时急停 → 回复ESTOPPED
+ *      b) CLEAR 命令 → 清除三模块急停但不恢复旧动作 → 回复CLEARED
  *      c) 角度目标 → 分别检查各轴在线和标定状态
  *                    → Yaw使用多圈目标, Pitch使用单圈目标
  *                    → 回复 OK/LOCKED
@@ -465,6 +467,8 @@ void control_in(void)
   {
     (void)GM6020_EmergencyStop();
     (void)ChassisCAN_EmergencyStop();
+    (void)FeederMotor_EmergencyStop();
+    (void)DualM3508_EmergencyStop();
     pending_ack = CONTROL_ACK_ESTOPPED;
     transmit_pending_ack();
     return;
@@ -512,6 +516,8 @@ void control_in(void)
   {
     GM6020_ClearEmergencyStop();
     ChassisCAN_ClearEmergencyStop();
+    FeederMotor_ClearEmergencyStop();
+    DualM3508_ClearEmergencyStop();
     pending_ack = CONTROL_ACK_CLEARED;
   }
   else if (!line_invalid
@@ -684,7 +690,11 @@ void control_out(void)
       (int)pitch_feedback->speed_rpm,
       yaw_feedback->online ? 1U : 0U,
       pitch_feedback->online ? 1U : 0U,
-      GM6020_IsEmergencyStopped() ? 1U : 0U);
+      (GM6020_IsEmergencyStopped()
+       || ChassisCAN_IsEmergencyStopped()
+       || FeederMotor_IsEmergencyStopped()
+       || DualM3508_IsEmergencyStopped())
+          ? 1U : 0U);
 
   if ((length > 0)
       && ((uint32_t)length < sizeof(feedback_reply)))

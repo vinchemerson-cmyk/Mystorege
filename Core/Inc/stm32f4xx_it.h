@@ -29,7 +29,8 @@ extern "C" {
 /**
  * ===========================================================================
  * @note  CubeMX 自动生成的中断向量声明。项目自定义中断:
- *          DMA1_Stream1_IRQHandler — DBUS DMA 接收完成中断 (优先级 0)
+ *          DMA1_Stream1_IRQHandler — DBUS DMA 接收完成中断 (优先级 5)
+ *          DMA2_Stream6_IRQHandler — USART6 TX DMA完成中断 (优先级 5)
  *          USART3_IRQHandler       — DBUS 串口中断 (优先级 ?)
  *          USART6_IRQHandler       — 调试串口中断 (优先级 5)
  *          TIM6_DAC_IRQHandler     — HAL 时基中断 (优先级 15, 替代 SysTick)
@@ -65,12 +66,12 @@ void BusFault_Handler(void);
 void UsageFault_Handler(void);
 void DebugMon_Handler(void);
 void DMA1_Stream1_IRQHandler(void);
+void DMA2_Stream6_IRQHandler(void);
 void USART3_IRQHandler(void);
+void USART6_IRQHandler(void);
 void TIM6_DAC_IRQHandler(void);
 void OTG_FS_IRQHandler(void);
 /* USER CODE BEGIN EFP */
-
-void USART6_IRQHandler(void);
 
 /* USER CODE END EFP */
 

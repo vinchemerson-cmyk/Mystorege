@@ -32,7 +32,8 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 enable_language(C ASM)
 
 # Create an executable object type
-add_executable(${CMAKE_PROJECT_NAME})
+add_executable(${CMAKE_PROJECT_NAME}
+        Core/Inc/config/feeder_params.h)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -47,6 +48,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motor_control.c
     Core/Src/control_input.c
     Core/Src/chassis_can.c
+    Core/Src/dual_m3508.c
+    Core/Src/feeder_motor.c
     Core/Src/bmi088.c
     Core/Src/bmi088_monitor.c
     Core/Src/dbus.c
@@ -54,6 +57,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/gimbal_calibration.c
     Core/Src/pitch_fusion.c
     Core/Src/remote_gimbal_control.c
+    Core/Src/uart_debug.c
 )
 
 # Add include paths

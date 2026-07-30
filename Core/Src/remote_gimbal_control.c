@@ -5,12 +5,16 @@
  * ===========================================================================
  *
  * 控制方式：
- *   CH0 → Yaw 目标角速度 → 积分得到 Yaw 多圈位置目标
+ *   GIMBAL_YAW_ONLY_TEST_MODE=1：
+ *     CH0 → Yaw目标RPM，绕过角度环，直接调试速度环
+ *   GIMBAL_YAW_ONLY_TEST_MODE=0：
+ *     CH0 → Yaw 目标角速度 → 积分得到 Yaw 多圈位置目标
  *   CH1 → Pitch 目标角速度 → 积分得到 Pitch 单圈位置目标
  *   CH2 → 底盘横移速度 vy
  *   CH3 → 底盘前进速度 vx
  *   S1上挡 → 云台与底盘急停；S1中/下挡 → 解除急停（临时映射）
  *   S2上/中/下挡 → 底盘跟随/不跟随/小陀螺模式
+ *   S1下挡进入拨弹盘测试：S2上=方向A，中/下=停止；底盘保持可控
  *
  * 每个轴独立检查以下接管条件：
  *   - DBUS 最近100 ms内收到过合法帧；
@@ -27,6 +31,8 @@
 #include "chassis_can.h"
 #include "config/gimbal_params.h"
 #include "dbus.h"
+#include "dual_m3508.h"
+#include "feeder_motor.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
 #include "pitch_fusion.h"
@@ -211,7 +217,18 @@ static void process_temporary_s1_safety(
     if (!GM6020_IsEmergencyStopped())
     {
       (void)GM6020_EmergencyStop();
+    }
+    if (!ChassisCAN_IsEmergencyStopped())
+    {
       (void)ChassisCAN_EmergencyStop();
+    }
+    if (!FeederMotor_IsEmergencyStopped())
+    {
+      (void)FeederMotor_EmergencyStop();
+    }
+    if (!DualM3508_IsEmergencyStopped())
+    {
+      (void)DualM3508_EmergencyStop();
     }
   }
   else if (((s1_position == DBUS_SWITCH_MIDDLE)
@@ -220,6 +237,11 @@ static void process_temporary_s1_safety(
   {
     GM6020_ClearEmergencyStop();
     ChassisCAN_ClearEmergencyStop();
+    FeederMotor_ClearEmergencyStop();
+    if (DualM3508_IsEmergencyStopped())
+    {
+      DualM3508_ClearEmergencyStop();
+    }
   }
 
   remote_control.last_s1_position = s1_position;
@@ -293,6 +315,68 @@ static void process_chassis_control(
 }
 
 /*
+ * S1下挡请求启动双M3508摩擦轮；其他挡位、DBUS掉线或急停均请求关闭。
+ * 故障锁存由DualM3508模块内部处理，必须回到S1中挡后才允许复位。
+ */
+static void process_friction_control(
+    const DBUS_Data_t *dbus_data)
+{
+  bool enabled;
+
+  if ((dbus_data == NULL)
+      || !dbus_data->online
+      || !dbus_data->last_frame_valid)
+  {
+    DualM3508_DisableUntilOff();
+    return;
+  }
+
+  enabled =
+      !GM6020_IsEmergencyStopped()
+      && !DualM3508_IsEmergencyStopped()
+      && (dbus_data->switch_value[REMOTE_GIMBAL_S1_INDEX]
+          == DBUS_SWITCH_DOWN);
+
+  DualM3508_SetEnabled(enabled);
+}
+
+/*
+ * 拨弹盘临时方向测试组合：
+ *   S1中/上或DBUS无效 -> DISABLE
+ *   S1下 + S2中       -> NEUTRAL，保持100 ms后解锁
+ *   S1下 + S2上       -> 方向A运行，不等待摩擦轮到速
+ *   S1下 + S2下       -> NEUTRAL，不再提供方向B入口
+ */
+static void process_feeder_control(
+    const DBUS_Data_t *dbus_data)
+{
+  FeederRemoteCommand_t command = FEEDER_REMOTE_DISABLE;
+
+  if ((dbus_data != NULL)
+      && dbus_data->online
+      && dbus_data->last_frame_valid
+      && !GM6020_IsEmergencyStopped()
+      && (dbus_data->switch_value[REMOTE_GIMBAL_S1_INDEX]
+          == DBUS_SWITCH_DOWN))
+  {
+    switch (dbus_data->switch_value[
+        REMOTE_CHASSIS_MODE_SWITCH_INDEX])
+    {
+      case DBUS_SWITCH_UP:
+        command = FEEDER_REMOTE_DIRECTION_A;
+        break;
+      case DBUS_SWITCH_DOWN:
+      case DBUS_SWITCH_MIDDLE:
+      default:
+        command = FEEDER_REMOTE_NEUTRAL;
+        break;
+    }
+  }
+
+  FeederMotor_SetRemoteCommand(command);
+}
+
+/*
  * 判断指定轴是否具备遥控器接管条件。
  *
  * 四个必要条件全部满足才返回true：
@@ -353,8 +437,8 @@ void RemoteGimbalControl_Init(void)
  *
  * 【控制流程】
  *   1. 分别检查两轴接管条件，不满足的轴单独deactivate
- *   2. 某轴首次接管 → 从该轴实时位置建立积分起点
- *   3. 已接管轴 → normalize_channel → 角速度积分 → 限幅 → 下传目标
+ *   2. Yaw-only模式下：CH0直接映射目标RPM，进入纯速度环调试
+ *   3. 双轴模式下：从实时位置建立积分起点，再积分角速度下传位置目标
  *
  * 【积分公式】
  *   new_target = old_target + normalized * direction * max_rate * (delta_ms / 1000)
@@ -376,11 +460,20 @@ void RemoteGimbalControl_Process(void)
   uint32_t delta_ms;
   float yaw_input;
   float pitch_input;
+#if GIMBAL_YAW_ONLY_TEST_MODE
+  float yaw_target_speed_rpm;
+#else
+  float yaw_rate_dps;
+#endif
+  float pitch_rate_dps;
+  float previous_target_deg;
   float pitch_feedback_deg;
   float pitch_feedback_rpm;
 
   process_temporary_s1_safety(dbus_data);
   process_chassis_control(dbus_data);
+  process_friction_control(dbus_data);
+  process_feeder_control(dbus_data);
 
   yaw_available = remote_axis_is_available(
       dbus_data, GM6020_AXIS_YAW);
@@ -405,10 +498,23 @@ void RemoteGimbalControl_Process(void)
   if (!yaw_available)
   {
     remote_control.axis_active[GM6020_AXIS_YAW] = false;
+#if GIMBAL_YAW_ONLY_TEST_MODE
+    /*
+     * DBUS、标定或Yaw反馈任一条件失效时，先把速度目标清零。
+     * 反馈超时和急停仍由电机控制层进一步强制零电流。
+     */
+    GM6020_SetSpeedDebugTarget(
+        GM6020_AXIS_YAW, 0.0f);
+#else
+    GM6020_SetPositionFeedforward(
+        GM6020_AXIS_YAW, 0.0f, 0.0f);
+#endif
   }
   if (!pitch_available)
   {
     remote_control.axis_active[GM6020_AXIS_PITCH] = false;
+    GM6020_SetPositionFeedforward(
+        GM6020_AXIS_PITCH, 0.0f, 0.0f);
   }
 
   delta_ms = (uint32_t)(now - remote_control.last_process_ms);
@@ -425,6 +531,30 @@ void RemoteGimbalControl_Process(void)
 
   if (yaw_available)
   {
+#if GIMBAL_YAW_ONLY_TEST_MODE
+    yaw_input = normalize_channel(
+        dbus_data->centered_channel[
+            REMOTE_GIMBAL_YAW_CHANNEL]);
+    yaw_target_speed_rpm =
+        yaw_input
+        * REMOTE_GIMBAL_YAW_DIRECTION
+        * YAW_REMOTE_SPEED_DEBUG_MAX_RPM;
+
+    /*
+     * 首次接管或其他模块退出速度模式后，从0 RPM重新进入速度调试，
+     * 随后把当前CH0映射结果提交给速度环。角度环在该模式下完全绕过。
+     */
+    if (!remote_control.axis_active[GM6020_AXIS_YAW]
+        || (GM6020_GetControlMode(GM6020_AXIS_YAW)
+            != GM6020_MODE_SPEED_DEBUG))
+    {
+      GM6020_EnterSpeedDebug(
+          GM6020_AXIS_YAW, 0.0f);
+      remote_control.axis_active[GM6020_AXIS_YAW] = true;
+    }
+    GM6020_SetSpeedDebugTarget(
+        GM6020_AXIS_YAW, yaw_target_speed_rpm);
+#else
     if (!remote_control.axis_active[GM6020_AXIS_YAW])
     {
       if (GM6020_GetMultiTurnPosition(
@@ -435,6 +565,8 @@ void RemoteGimbalControl_Process(void)
         GM6020_SetMultiTurnTargetPosition(
             GM6020_AXIS_YAW,
             remote_control.yaw_target_deg);
+        GM6020_SetPositionFeedforward(
+            GM6020_AXIS_YAW, 0.0f, 0.0f);
       }
     }
     else if (delta_ms > 0U)
@@ -442,10 +574,13 @@ void RemoteGimbalControl_Process(void)
       yaw_input = normalize_channel(
           dbus_data->centered_channel[
               REMOTE_GIMBAL_YAW_CHANNEL]);
-      remote_control.yaw_target_deg +=
+      yaw_rate_dps =
           yaw_input
           * REMOTE_GIMBAL_YAW_DIRECTION
-          * REMOTE_GIMBAL_YAW_MAX_RATE_DPS
+          * REMOTE_GIMBAL_YAW_MAX_RATE_DPS;
+      previous_target_deg = remote_control.yaw_target_deg;
+      remote_control.yaw_target_deg +=
+          yaw_rate_dps
           * (float)delta_ms
           / 1000.0f;
       remote_control.yaw_target_deg = clamp_float(
@@ -455,7 +590,15 @@ void RemoteGimbalControl_Process(void)
       GM6020_SetMultiTurnTargetPosition(
           GM6020_AXIS_YAW,
           remote_control.yaw_target_deg);
+      yaw_rate_dps =
+          (remote_control.yaw_target_deg - previous_target_deg)
+          * 1000.0f / (float)delta_ms;
+      GM6020_SetPositionFeedforward(
+          GM6020_AXIS_YAW,
+          yaw_rate_dps / 6.0f,
+          0.0f);
     }
+#endif
   }
 
   if (pitch_available)
@@ -482,6 +625,8 @@ void RemoteGimbalControl_Process(void)
         GM6020_SetTargetPosition(
             GM6020_AXIS_PITCH,
             remote_control.pitch_target_deg);
+        GM6020_SetPositionFeedforward(
+            GM6020_AXIS_PITCH, 0.0f, 0.0f);
       }
     }
     else if (delta_ms > 0U)
@@ -489,10 +634,13 @@ void RemoteGimbalControl_Process(void)
       pitch_input = normalize_channel(
           dbus_data->centered_channel[
               REMOTE_GIMBAL_PITCH_CHANNEL]);
-      remote_control.pitch_target_deg +=
+      pitch_rate_dps =
           pitch_input
           * REMOTE_GIMBAL_PITCH_DIRECTION
-          * REMOTE_GIMBAL_PITCH_MAX_RATE_DPS
+          * REMOTE_GIMBAL_PITCH_MAX_RATE_DPS;
+      previous_target_deg = remote_control.pitch_target_deg;
+      remote_control.pitch_target_deg +=
+          pitch_rate_dps
           * (float)delta_ms
           / 1000.0f;
       remote_control.pitch_target_deg = clamp_float(
@@ -502,6 +650,14 @@ void RemoteGimbalControl_Process(void)
       GM6020_SetTargetPosition(
           GM6020_AXIS_PITCH,
           remote_control.pitch_target_deg);
+      pitch_rate_dps =
+          (remote_control.pitch_target_deg
+           - previous_target_deg)
+          * 1000.0f / (float)delta_ms;
+      GM6020_SetPositionFeedforward(
+          GM6020_AXIS_PITCH,
+          pitch_rate_dps / 6.0f,
+          0.0f);
     }
   }
 }

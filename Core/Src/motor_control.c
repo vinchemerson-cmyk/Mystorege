@@ -49,6 +49,8 @@
 #define GM6020_ENCODER_HALF_CPR       ((int32_t)(GM6020_ENCODER_CPR / 2U))
 #define GM6020_CONTROL_PERIOD_S       0.001f
 #define GM6020_ZERO_SET_MAX_SPEED_RPM 2
+#define GM6020_RPM_TO_DPS             6.0f
+#define GM6020_DEG_TO_RAD             0.017453292519943295f
 
 /*
  * 控制状态机枚举。
@@ -128,6 +130,10 @@ typedef struct
   /* ---- 速度调试 ---- */
   float target_speed_rpm;             /* 当前目标转速（位置控制时由角度环输出） */
   float debug_target_speed_rpm;       /* 速度调试模式下的人工目标转速 */
+  float command_speed_feedforward_rpm;/* 位置轨迹目标速度前馈 */
+  float command_accel_feedforward_rpm_s;/* 位置轨迹目标加速度前馈 */
+  float applied_speed_feedforward_rpm;/* 本拍角度环实际叠加量 */
+  float applied_current_feedforward;  /* 本拍速度环实际叠加量 */
   bool speed_debug_requested;         /* 是否正在/请求进入速度调试模式 */
 
   /* ---- 位置命令 ---- */
@@ -256,6 +262,46 @@ static const GM6020_AxisMechanicalConfig_t axis_mechanical_config[
   }
 };
 
+typedef struct
+{
+  float target_rate_gain;
+  float base_rate_gain;
+  float gravity_sin_current;
+  float gravity_cos_current;
+  float gravity_bias_current;
+  float static_friction_current;
+  float velocity_current_per_rpm;
+  float acceleration_current_per_rpm_s;
+  float current_limit;
+} GM6020_AxisFeedforwardConfig_t;
+
+static const GM6020_AxisFeedforwardConfig_t axis_feedforward_config[
+    GM6020_AXIS_COUNT] =
+{
+  {
+    YAW_TARGET_RATE_FF_GAIN,
+    YAW_BASE_RATE_FF_GAIN,
+    YAW_GRAVITY_SIN_FF_CURRENT,
+    YAW_GRAVITY_COS_FF_CURRENT,
+    YAW_GRAVITY_BIAS_FF_CURRENT,
+    YAW_STATIC_FRICTION_FF_CURRENT,
+    YAW_VELOCITY_FF_CURRENT_PER_RPM,
+    YAW_ACCEL_FF_CURRENT_PER_RPM_S,
+    YAW_FEEDFORWARD_CURRENT_LIMIT
+  },
+  {
+    PITCH_TARGET_RATE_FF_GAIN,
+    PITCH_BASE_RATE_FF_GAIN,
+    PITCH_GRAVITY_SIN_FF_CURRENT,
+    PITCH_GRAVITY_COS_FF_CURRENT,
+    PITCH_GRAVITY_BIAS_FF_CURRENT,
+    PITCH_STATIC_FRICTION_FF_CURRENT,
+    PITCH_VELOCITY_FF_CURRENT_PER_RPM,
+    PITCH_ACCEL_FF_CURRENT_PER_RPM_S,
+    PITCH_FEEDFORWARD_CURRENT_LIMIT
+  }
+};
+
 /* ---- 模块级全局变量 ---- */
 
 static CAN_HandleTypeDef *motor_can[GM6020_AXIS_COUNT];  /* 每轴独立 CAN 句柄 */
@@ -279,6 +325,14 @@ static bool controller_is_pitch(
     const GM6020_Controller_t *controller)
 {
   return controller == &controllers[GM6020_AXIS_PITCH];
+}
+
+static GM6020_Axis_t controller_axis(
+    const GM6020_Controller_t *controller)
+{
+  return controller_is_pitch(controller)
+      ? GM6020_AXIS_PITCH
+      : GM6020_AXIS_YAW;
 }
 
 static bool motor_can_is_initialized(void)
@@ -318,13 +372,27 @@ static bool axis_configuration_is_valid(GM6020_Axis_t axis)
       &axis_pid_config[axis];
   const GM6020_AxisMechanicalConfig_t *mechanical =
       &axis_mechanical_config[axis];
+  const GM6020_AxisFeedforwardConfig_t *feedforward =
+      &axis_feedforward_config[axis];
 
   if ((can_config->feedback_std_id > 0x7FFU)
       || (can_config->current_slot > 3U)
       || (can_config->filter_bank > 27U)
       || !(pid_config->speed_output_limit > 0.0f)
       || !(pid_config->angle_speed_limit_rpm > 0.0f)
-      || !isfinite(mechanical->zero_offset_deg))
+      || !isfinite(mechanical->zero_offset_deg)
+      || !isfinite(feedforward->target_rate_gain)
+      || !isfinite(feedforward->base_rate_gain)
+      || !isfinite(feedforward->gravity_sin_current)
+      || !isfinite(feedforward->gravity_cos_current)
+      || !isfinite(feedforward->gravity_bias_current)
+      || !isfinite(feedforward->static_friction_current)
+      || !isfinite(feedforward->velocity_current_per_rpm)
+      || !isfinite(feedforward->acceleration_current_per_rpm_s)
+      || !isfinite(feedforward->current_limit)
+      || (feedforward->current_limit < 0.0f)
+      || !(GM6020_POSITION_FF_ACCEL_LIMIT_RPM_S > 0.0f)
+      || !(GM6020_FRICTION_TRANSITION_RPM > 0.0f))
   {
     return false;
   }
@@ -364,6 +432,15 @@ static void angle_pid_reset(GM6020_Controller_t *controller)
   controller->angle_pid.integral = 0.0f;
   controller->angle_pid.previous_error = 0.0f;
   controller->angle_pid.output = 0.0f;
+}
+
+static void position_feedforward_reset(
+    GM6020_Controller_t *controller)
+{
+  controller->command_speed_feedforward_rpm = 0.0f;
+  controller->command_accel_feedforward_rpm_s = 0.0f;
+  controller->applied_speed_feedforward_rpm = 0.0f;
+  controller->applied_current_feedforward = 0.0f;
 }
 
 /*====================================================================
@@ -462,14 +539,9 @@ static void angle_resolve_single_turn_target(
   /* ── 步骤3: 叠加到当前多圈累计值 → 多圈目标 ── */
     delta += GM6020_ENCODER_CPR;
   }
-  /* Target change → reset angle PID to avoid integral windup from old target */
-
   /* 叠加到当前多圈累计值，得到最终多圈目标 */
   controller->target_total_angle_ecd =
       controller->feedback.total_angle_ecd + delta;
-
-  /* 目标变更后重置角度环 PID，防止历史积分干扰新目标 */
-  angle_pid_reset(controller);
 }
 
 /*
@@ -506,7 +578,6 @@ static void angle_resolve_multi_turn_target(
           ? (target_encoder + 0.5)
           : (target_encoder - 0.5));
 
-  angle_pid_reset(controller);
 }
 
 /*
@@ -547,6 +618,7 @@ static void controller_hold_relative_position(
   angle_resolve_single_turn_target(
       controller,
       requested_encoder_angle_deg);
+  angle_pid_reset(controller);
 }
 
 /*
@@ -662,8 +734,78 @@ static void encoder_update(GM6020_Controller_t *controller,
 }
 
 /*====================================================================
- * PID 更新函数（含 anti-windup）
+ * 前馈与PID更新函数（含总输出anti-windup）
  *====================================================================*/
+
+static float position_speed_feedforward_rpm(
+    GM6020_Controller_t *controller)
+{
+  const GM6020_Axis_t axis = controller_axis(controller);
+  const GM6020_AxisFeedforwardConfig_t *config =
+      &axis_feedforward_config[axis];
+  float feedforward_rpm =
+      config->target_rate_gain
+      * controller->command_speed_feedforward_rpm;
+
+  /*
+   * 当前BMI088融合器只估计Pitch底座扰动：
+   * base_rate = inertial_rate - relative_encoder_rate。
+   * 为保持惯性角，电机相对速度前馈取其反向。
+   */
+  if ((axis == GM6020_AXIS_PITCH)
+      && (config->base_rate_gain != 0.0f))
+  {
+    const PitchFusionData_t *fusion = PitchFusion_GetData();
+
+    if ((fusion != NULL)
+        && (fusion->status == PITCH_FUSION_RUNNING)
+        && fusion->imu_valid
+        && fusion->motor_valid
+        && isfinite(fusion->base_disturbance_rate_dps))
+    {
+      feedforward_rpm -=
+          config->base_rate_gain
+          * fusion->base_disturbance_rate_dps
+          / GM6020_RPM_TO_DPS;
+    }
+  }
+
+  controller->applied_speed_feedforward_rpm =
+      feedforward_rpm;
+  return feedforward_rpm;
+}
+
+static float model_current_feedforward(
+    GM6020_Controller_t *controller,
+    float feedback_position_deg)
+{
+  const GM6020_Axis_t axis = controller_axis(controller);
+  const GM6020_AxisFeedforwardConfig_t *config =
+      &axis_feedforward_config[axis];
+  const float motion_speed_rpm =
+      controller->applied_speed_feedforward_rpm;
+  const float position_rad =
+      feedback_position_deg * GM6020_DEG_TO_RAD;
+  const float friction_blend =
+      motion_speed_rpm
+      / (fabsf(motion_speed_rpm)
+         + GM6020_FRICTION_TRANSITION_RPM);
+  float current =
+      config->gravity_sin_current * sinf(position_rad)
+      + config->gravity_cos_current * cosf(position_rad)
+      + config->gravity_bias_current
+      + config->static_friction_current * friction_blend
+      + config->velocity_current_per_rpm * motion_speed_rpm
+      + config->acceleration_current_per_rpm_s
+        * controller->command_accel_feedforward_rpm_s;
+
+  current = clamp_float(
+      current,
+      -config->current_limit,
+      config->current_limit);
+  controller->applied_current_feedforward = current;
+  return current;
+}
 
 /*
  * 角度环 PID 更新。
@@ -685,7 +827,8 @@ static void encoder_update(GM6020_Controller_t *controller,
  */
 static float angle_pid_update(
     GM6020_Controller_t *controller,
-    float feedback_position_deg)
+    float feedback_position_deg,
+    float speed_feedforward_rpm)
 {
   AnglePID_t *pid = &controller->angle_pid;
   float output_limit = controller->angle_speed_limit_rpm;
@@ -718,7 +861,9 @@ static float angle_pid_update(
 
   /* ── 步骤3: 计算 P+D 项 (用于 anti-windup 判断) ── */
   const float proportional_and_derivative =
-      pid->kp * error + pid->kd * derivative;  /* P_term + D_term */
+      pid->kp * error
+      + pid->kd * derivative
+      + speed_feedforward_rpm;
 
   /* ── 步骤4: 计算积分候选值 (Integral Candidate) ── */
   /* I_candidate = old_I + Ki × error × Δt, 预先限幅到 ±output_limit 防止绝对值过大 */
@@ -771,8 +916,9 @@ static float angle_pid_update(
  * 【Anti-windup 逻辑】与角度环相同，参见 angle_pid_update() 的注释。
  */
 static float speed_pid_update(GM6020_Controller_t *controller,
-                               float target,
-                               float feedback)
+                              float target,
+                              float feedback,
+                              float current_feedforward)
 {
   SpeedPID_t *pid = &controller->speed_pid;
   float output_limit = controller->speed_output_limit;
@@ -794,7 +940,9 @@ static float speed_pid_update(GM6020_Controller_t *controller,
 
   /* ── 步骤3: P+D 项 ── */
   const float proportional_and_derivative =
-      pid->kp * error + pid->kd * derivative;
+      pid->kp * error
+      + pid->kd * derivative
+      + current_feedforward;
 
   /* ── 步骤4: 积分候选值 (先限幅) ── */
   const float candidate_integral = clamp_float(
@@ -949,6 +1097,8 @@ static void state_position_control_on_feedback(
       controller_encoder_relative_position_deg(controller);
   float feedback_speed_rpm =
       (float)controller->feedback.speed_rpm;
+  float speed_feedforward_rpm;
+  float current_feedforward;
   bool fusion_available = false;
 
   if (controller_is_pitch(controller))
@@ -969,12 +1119,21 @@ static void state_position_control_on_feedback(
       controller_hold_relative_position(
           controller,
           feedback_position_deg);
+      position_feedforward_reset(controller);
       speed_pid_reset(controller);
     }
   }
 
+  speed_feedforward_rpm =
+      position_speed_feedforward_rpm(controller);
+
   /* 外环：位置 → 目标转速 */
   controller->target_speed_rpm = angle_pid_update(
+      controller,
+      feedback_position_deg,
+      speed_feedforward_rpm);
+
+  current_feedforward = model_current_feedforward(
       controller,
       feedback_position_deg);
 
@@ -982,7 +1141,8 @@ static void state_position_control_on_feedback(
   controller->current_command = (int16_t)speed_pid_update(
       controller,
       controller->target_speed_rpm,
-      feedback_speed_rpm);
+      feedback_speed_rpm,
+      current_feedforward);
 }
 
 /*
@@ -1001,7 +1161,8 @@ static void state_speed_debug_on_feedback(
       controller,
       controller->target_speed_rpm,
 /* 状态→反馈处理函数映射表，索引与 GM6020_ControlState_t 枚举对齐 */
-      (float)controller->feedback.speed_rpm);
+      (float)controller->feedback.speed_rpm,
+      0.0f);
 }
 
 /* 状态 → 反馈处理函数映射表，索引与 GM6020_ControlState_t 枚举对齐 */
@@ -1037,6 +1198,7 @@ static void control_state_transition(
 {
   controller->state = next_state;
   controller->current_command = 0;
+  position_feedforward_reset(controller);
 
   switch (controller->state)
   {
@@ -1384,6 +1546,7 @@ HAL_StatusTypeDef GM6020_EmergencyStop(void)
     controller->speed_debug_requested = false;
     controller->position_target_valid = false;
     controller->requested_angle_is_multi_turn = false;
+    position_feedforward_reset(controller);
     speed_pid_reset(controller);
     angle_pid_reset(controller);
   }
@@ -1459,6 +1622,7 @@ static void apply_zero_offset_ecd(
   controller->pitch_fusion_feedback_active = false;
   controller->target_speed_rpm = 0.0f;
   controller->current_command = 0;
+  position_feedforward_reset(controller);
   speed_pid_reset(controller);
   angle_pid_reset(controller);
 
@@ -1570,6 +1734,7 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
   float limited_angle_deg;
   float minimum_angle_deg;
   float maximum_angle_deg;
+  bool reset_angle_pid;
 
   if (emergency_stop_latched
       || !axis_is_valid(axis)
@@ -1578,6 +1743,9 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
     return;
   }
   controller = &controllers[axis];
+  reset_angle_pid =
+      !controller->position_target_valid
+      || controller->requested_angle_is_multi_turn;
 
   /* 步骤1：软限位 */
   limited_angle_deg = target_angle_deg;
@@ -1631,6 +1799,11 @@ void GM6020_SetTargetPosition(GM6020_Axis_t axis,
           limited_angle_deg + controller->zero_offset_deg);
   controller->requested_angle_is_multi_turn = false;
   controller->position_target_valid = true;
+  position_feedforward_reset(controller);
+  if (reset_angle_pid)
+  {
+    angle_pid_reset(controller);
+  }
 
   /* 步骤3：如果已在位置控制，立即解析目标 */
   if (controller->state == GM6020_STATE_POSITION_CONTROL)
@@ -1646,6 +1819,7 @@ void GM6020_SetMultiTurnTargetPosition(
     float target_angle_deg)
 {
   GM6020_Controller_t *controller;
+  bool reset_angle_pid;
 
   if (emergency_stop_latched
       || !axis_is_valid(axis)
@@ -1655,9 +1829,17 @@ void GM6020_SetMultiTurnTargetPosition(
   }
 
   controller = &controllers[axis];
+  reset_angle_pid =
+      !controller->position_target_valid
+      || !controller->requested_angle_is_multi_turn;
   controller->requested_angle_deg = target_angle_deg;
   controller->requested_angle_is_multi_turn = true;
   controller->position_target_valid = true;
+  position_feedforward_reset(controller);
+  if (reset_angle_pid)
+  {
+    angle_pid_reset(controller);
+  }
 
   if (controller->state == GM6020_STATE_POSITION_CONTROL)
   {
@@ -1682,6 +1864,38 @@ void GM6020_SetGimbalPosition(float yaw_angle_deg,
       GM6020_AXIS_YAW, yaw_angle_deg);
   GM6020_SetTargetPosition(
       GM6020_AXIS_PITCH, pitch_angle_deg);
+}
+
+void GM6020_SetPositionFeedforward(
+    GM6020_Axis_t axis,
+    float target_speed_rpm,
+    float target_acceleration_rpm_s)
+{
+  GM6020_Controller_t *controller;
+
+  if (!axis_is_valid(axis))
+  {
+    return;
+  }
+
+  controller = &controllers[axis];
+  if (emergency_stop_latched
+      || !isfinite(target_speed_rpm)
+      || !isfinite(target_acceleration_rpm_s)
+      || !controller->position_target_valid)
+  {
+    position_feedforward_reset(controller);
+    return;
+  }
+
+  controller->command_speed_feedforward_rpm = clamp_float(
+      target_speed_rpm,
+      -controller->angle_speed_limit_rpm,
+      controller->angle_speed_limit_rpm);
+  controller->command_accel_feedforward_rpm_s = clamp_float(
+      target_acceleration_rpm_s,
+      -GM6020_POSITION_FF_ACCEL_LIMIT_RPM_S,
+      GM6020_POSITION_FF_ACCEL_LIMIT_RPM_S);
 }
 
 /*
@@ -1903,6 +2117,11 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
   data.speed_error_rpm =
       data.target_speed_rpm - data.feedback_speed_rpm;
   data.output_current = controller->speed_pid.output;
+  data.command_current = controller->current_command;
+  data.speed_feedforward_rpm =
+      controller->applied_speed_feedforward_rpm;
+  data.current_feedforward =
+      controller->applied_current_feedforward;
   data.kp = controller->speed_pid.kp;
   data.ki = controller->speed_pid.ki;
   data.kd = controller->speed_pid.kd;
@@ -2106,4 +2325,32 @@ bool GM6020_GetMultiTurnPosition(
               - controller->multi_turn_origin_ecd)
       * 360.0f / (float)GM6020_ENCODER_CPR;
   return true;
+}
+
+bool GM6020_GetTargetPosition(
+    GM6020_Axis_t axis,
+    float *position_deg)
+{
+  const GM6020_Controller_t *controller;
+
+  if (!axis_is_valid(axis) || (position_deg == NULL))
+  {
+    return false;
+  }
+
+  controller = &controllers[axis];
+  if (emergency_stop_latched
+      || (controller->state != GM6020_STATE_POSITION_CONTROL)
+      || !controller->feedback.online
+      || !controller->encoder_initialized
+      || !controller->multi_turn_origin_valid)
+  {
+    return false;
+  }
+
+  *position_deg =
+      (float)(controller->target_total_angle_ecd
+              - controller->multi_turn_origin_ecd)
+      * 360.0f / (float)GM6020_ENCODER_CPR;
+  return isfinite(*position_deg);
 }

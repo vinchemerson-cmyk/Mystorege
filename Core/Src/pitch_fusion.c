@@ -7,7 +7,8 @@
  * 融合流程：
  *   1. 等待 Pitch 电机完成上电零位标定，且 BMI088 / 电机反馈均有效；
  *   2. 静止采集约 500 ms，估计陀螺零偏和 IMU重力角到编码器零位的偏差；
- *   3. 用陀螺角速度预测，用可信的加速度重力角进行低频修正；
+ *   3. 用二维Kalman估计惯性Pitch角与陀螺零偏：陀螺负责预测，
+ *      可信的加速度重力角负责观测更新；
  *   4. 同时发布编码器角度/速度以及
  *      base_disturbance_rate = gyro_rate - encoder_rate。
  *
@@ -43,6 +44,10 @@ typedef struct
   float accel_minus_encoder_offset_deg;
   uint32_t last_imu_sample_count;
   uint32_t last_imu_timestamp_ms;
+  float covariance_00;
+  float covariance_01;
+  float covariance_10;
+  float covariance_11;
   bool calibrated;
 } PitchFusionContext_t;
 
@@ -77,6 +82,16 @@ static void pitch_fusion_reset_calibration(void)
   pitch_fusion.calibration_gyro_sum_dps = 0.0f;
   pitch_fusion.calibration_accel_minus_encoder_sum_deg = 0.0f;
   pitch_fusion.output.calibration_sample_count = 0U;
+}
+
+static void pitch_fusion_reset_covariance(void)
+{
+  pitch_fusion.covariance_00 =
+      PITCH_KALMAN_INITIAL_ANGLE_VARIANCE_DEG2;
+  pitch_fusion.covariance_01 = 0.0f;
+  pitch_fusion.covariance_10 = 0.0f;
+  pitch_fusion.covariance_11 =
+      PITCH_KALMAN_INITIAL_BIAS_VARIANCE_DPS2;
 }
 
 static bool pitch_fusion_read_motor(
@@ -169,6 +184,7 @@ static bool pitch_fusion_decode_imu(
 void PitchFusion_Init(void)
 {
   memset(&pitch_fusion, 0, sizeof(pitch_fusion));
+  pitch_fusion_reset_covariance();
   pitch_fusion.output.status = PITCH_FUSION_WAITING_DATA;
 }
 
@@ -329,6 +345,7 @@ void PitchFusion_Process(void)
       pitch_fusion.output.recovery_pending = false;
       pitch_fusion.last_imu_timestamp_ms =
           sample.timestamp_ms;
+      pitch_fusion_reset_covariance();
       pitch_fusion.calibrated = true;
       pitch_fusion.output.status = PITCH_FUSION_RUNNING;
     }
@@ -349,6 +366,10 @@ void PitchFusion_Process(void)
     float corrected_gyro_rate_dps;
     float predicted_pitch_deg;
     float accel_innovation_deg;
+    float predicted_covariance_00;
+    float predicted_covariance_01;
+    float predicted_covariance_10;
+    float predicted_covariance_11;
 
     corrected_gyro_rate_dps =
         gyro_pitch_rate_dps
@@ -385,6 +406,7 @@ void PitchFusion_Process(void)
           corrected_gyro_rate_dps - encoder_rate_dps;
       pitch_fusion.last_imu_timestamp_ms =
           sample.timestamp_ms;
+      pitch_fusion_reset_covariance();
       if (pitch_fusion.output.accel_trusted)
       {
         pitch_fusion.output.recovery_sample_count = 1U;
@@ -410,6 +432,30 @@ void PitchFusion_Process(void)
     predicted_pitch_deg =
         pitch_fusion.output.fused_pitch_deg
         + corrected_gyro_rate_dps * delta_time_s;
+
+    /*
+     * Kalman预测：
+     *   x = [angle, gyro_bias]
+     *   F = [1, -dt; 0, 1]
+     */
+    predicted_covariance_00 =
+        pitch_fusion.covariance_00
+        - delta_time_s
+          * (pitch_fusion.covariance_01
+             + pitch_fusion.covariance_10)
+        + delta_time_s * delta_time_s
+          * pitch_fusion.covariance_11
+        + PITCH_KALMAN_PROCESS_ANGLE_NOISE_DEG2;
+    predicted_covariance_01 =
+        pitch_fusion.covariance_01
+        - delta_time_s * pitch_fusion.covariance_11;
+    predicted_covariance_10 =
+        pitch_fusion.covariance_10
+        - delta_time_s * pitch_fusion.covariance_11;
+    predicted_covariance_11 =
+        pitch_fusion.covariance_11
+        + PITCH_KALMAN_PROCESS_BIAS_NOISE_DPS2;
+
     accel_innovation_deg = pitch_fusion_wrap_degrees(
         pitch_fusion.output.accel_pitch_aligned_deg
         - predicted_pitch_deg);
@@ -422,28 +468,69 @@ void PitchFusion_Process(void)
 
     if (pitch_fusion.output.accel_trusted)
     {
-      const float gyro_weight =
-          PITCH_FUSION_ACCEL_CORRECTION_TAU_S
-          / (PITCH_FUSION_ACCEL_CORRECTION_TAU_S
-             + delta_time_s);
+      const float innovation_covariance =
+          predicted_covariance_00
+          + PITCH_KALMAN_ACCEL_MEASUREMENT_NOISE_DEG2;
+      const float angle_gain =
+          predicted_covariance_00 / innovation_covariance;
+      const float bias_gain =
+          predicted_covariance_10 / innovation_covariance;
+      const float covariance_factor = 1.0f - angle_gain;
+      float updated_covariance_01;
+      float updated_covariance_11;
+
       pitch_fusion.output.fused_pitch_deg =
           predicted_pitch_deg
-          + (1.0f - gyro_weight)
-          * accel_innovation_deg;
+          + angle_gain * accel_innovation_deg;
+      pitch_fusion.output.gyro_bias_dps +=
+          bias_gain * accel_innovation_deg;
+
+      /*
+       * Joseph形式 P=(I-KH)P-(I-KH)' + KRK'，并强制P01/P10对称，
+       * 避免长时间单精度运算导致协方差失去正定性。
+       */
+      pitch_fusion.covariance_00 =
+          covariance_factor * covariance_factor
+          * predicted_covariance_00
+          + angle_gain * angle_gain
+            * PITCH_KALMAN_ACCEL_MEASUREMENT_NOISE_DEG2;
+      updated_covariance_01 =
+          covariance_factor
+          * (predicted_covariance_01
+             - bias_gain * predicted_covariance_00)
+          + angle_gain * bias_gain
+            * PITCH_KALMAN_ACCEL_MEASUREMENT_NOISE_DEG2;
+      pitch_fusion.covariance_01 = updated_covariance_01;
+      pitch_fusion.covariance_10 = updated_covariance_01;
+      updated_covariance_11 =
+          predicted_covariance_11
+          - bias_gain
+            * (predicted_covariance_01
+               + predicted_covariance_10)
+          + bias_gain * bias_gain
+            * (predicted_covariance_00
+               + PITCH_KALMAN_ACCEL_MEASUREMENT_NOISE_DEG2);
+      pitch_fusion.covariance_11 = updated_covariance_11;
     }
     else
     {
       pitch_fusion.output.fused_pitch_deg =
           predicted_pitch_deg;
+      pitch_fusion.covariance_00 = predicted_covariance_00;
+      pitch_fusion.covariance_01 = predicted_covariance_01;
+      pitch_fusion.covariance_10 = predicted_covariance_10;
+      pitch_fusion.covariance_11 = predicted_covariance_11;
     }
 
     pitch_fusion.output.gyro_pitch_rate_dps =
-        corrected_gyro_rate_dps;
+        gyro_pitch_rate_dps
+        - pitch_fusion.output.gyro_bias_dps;
     pitch_fusion.output.fused_pitch_rate_dps =
-        corrected_gyro_rate_dps;
+        pitch_fusion.output.gyro_pitch_rate_dps;
     pitch_fusion.output.base_disturbance_rate_dps =
         motor_valid
-        ? corrected_gyro_rate_dps - encoder_rate_dps
+        ? pitch_fusion.output.gyro_pitch_rate_dps
+          - encoder_rate_dps
         : 0.0f;
 
     if (pitch_fusion.output.recovery_pending)

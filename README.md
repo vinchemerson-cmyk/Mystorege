@@ -9,30 +9,37 @@ Yaw GM6020 使用 CAN1，Pitch GM6020 使用 CAN2；两台电机都设为 ID 2�
 - CAN1/Yaw、CAN2/Pitch 独立反馈解析与 `0x1FE` 电流发送
 - 单圈编码器多圈累计
 - 目标角度劣弧（最短路径）处理
-- 位置环、速度环串级 PID
+- 位置环、速度环串级PID，以及轨迹/模型前馈框架
 - 等待反馈、位置控制、速度调试、故障四状态控制
 - 反馈超时后零电流保护
 - USB CDC 双轴位置指令输入
-- DBUS 遥控器 DMA 接收、摇杆解析与 USB CDC 监视输出
+- DBUS 遥控器 DMA 接收、摇杆解析与 USART6 监视输出
 - DBUS右摇杆分别控制Yaw、Pitch云台位置目标
 - DBUS左摇杆控制底盘前进/横移速度，CAN1周期发送控制命令
-- BMI088初始化、1 kHz六轴采集，以及Pitch编码器/IMU融合诊断
+- CAN1 C610 ID3/M2006拨弹盘速度PID、反馈超时和堵转保护
+- CAN2 C620 ID1/ID2双M3508摩擦轮速度环、相反方向和到速诊断
+- BMI088初始化、1 kHz六轴采集，以及Pitch二维Kalman融合诊断
+- USART6 TX DMA统一输出云台、拨弹盘、摩擦轮、RC、底盘、IMU与融合数据
 
 ## 硬件与通信
 
 | 功能 | 配置 |
 | --- | --- |
 | MCU | STM32F407 |
-| CAN1 | PD0 = RX，PD1 = TX，1 Mbps；连接Yaw ID 2和底盘通信线路 |
-| USART6 | PG9 = RX，PG14 = TX，115200-8-N-1 |
+| CAN1 | PD0 = RX，PD1 = TX，1 Mbps；连接Yaw ID 2、C610 ID 3和底盘通信线路 |
+| USART6调试 | PG9 = RX，PG14 = TX，460800-8-N-1；TX使用DMA2 Stream6/Channel 5；对应外壳丝印`UART1`的3-pin口 |
 | USB CDC | `yaw,pitch\r\n`，角度单位为度 |
 | DBUS | PC11 = USART3_RX，100000-8-E-1，DMA 接收 |
-| CAN2 | PB5 = RX，PB6 = TX，1 Mbps；连接Pitch GM6020 ID 2 |
+| CAN2 | PB5 = RX，PB6 = TX，1 Mbps；连接Pitch GM6020 ID 2及C620 ID 1/2 |
 | BMI088 SPI1 | PB3 = SCK，PB4 = MISO，PA7 = MOSI，5.25 Mbps，Mode 0 |
 | BMI088片选 | PA4 = Accel CS，PB0 = Gyro CS |
 | Yaw反馈 | 上板CAN1标准帧 `0x206` |
 | Pitch反馈 | 上板CAN2标准帧 `0x206` |
-| 电流命令 | CAN1、CAN2 各自发送标准帧 `0x1FE`，DLC = 8 |
+| 拨弹盘反馈 | 上板CAN1标准帧 `0x203`，过滤器组1→FIFO1 |
+| 摩擦轮反馈 | 上板CAN2标准帧`0x201/0x202`，过滤器组15→FIFO1 |
+| GM6020电流命令 | CAN1、CAN2各自发送标准帧`0x1FE`，DLC=8 |
+| C610电流命令 | CAN1标准帧`0x200`，ID3使用`DATA[4:5]` |
+| C620电流命令 | CAN2标准帧`0x200`，ID1/ID2使用`DATA[0:3]` |
 
 两条总线上的 `0x1FE` 数据分配相同：
 
@@ -132,31 +139,20 @@ rpm，在线状态 `1` 表示近期收到对应电机的 CAN 反馈，急停状�
 ## DBUS 遥控器调试输出
 
 开发板通过 USART3 + DMA 接收固定 18 字节 DBUS 帧，主循环解析四个
-摇杆通道和两个三挡开关。当前RC数据已经验证，
-`freertos.c`中的`DBUS_Monitor_Process()`调用暂时注释，不再通过USB
-CDC周期输出；需要再次调试时取消注释即可。启用后的20 Hz输出格式为：
+摇杆通道和两个三挡开关。低优先级`uartDebugTask`格式化数据，通过
+USART6 TX DMA以约7.1 Hz输出遥控器和当前底盘待发送命令：
 
 ```text
-RC,frame,online,valid,ch0,ch1,ch2,ch3,s1,s2,c0,c1,c2,c3,invalid\r\n
+RC_CHASSIS,T=时间,F=总帧,VF=合法帧,IF=非法帧,ON=在线,LV=最近帧合法,
+R0=原始CH0,R1=原始CH1,R2=原始CH2,R3=原始CH3,
+C0=CH0去中心,C1=CH1去中心,C2=CH2去中心,C3=CH3去中心,
+S1=拨杆1,S2=拨杆2,VX=前进速度,VY=横移速度,WZ=旋转速度,
+OFF=偏移角,M=底盘模式,CE=底盘急停,TXE=串口发送错误\r\n
 ```
 
-- `frame`：已经处理的完整 18 字节帧数；
-- `online`：最近 100 ms 内收到过合法帧时为 `1`；
-- `valid`：最近处理的一帧通过范围检查时为 `1`；
-- `ch0~ch3`：摇杆原始值，正常约 `364~1684`，回中约 `1024`；
-- `s1/s2`：三挡开关编码，上=`1`、下=`2`、中=`3`；
-- `c0~c3`：去中心后的摇杆值，正常约 `-660~+660`；
-- `invalid`：累计非法帧数。
-
-例如摇杆全部回中时可能看到：
-
-```text
-RC,123,1,1,1024,1024,1024,1024,1,3,0,0,0,0,0
-```
-
-电脑连接开发板 USB 虚拟串口后，用串口助手以 ASCII 文本显示即可。
-建议界面选择 `115200、8-N-1`（USB CDC 实际不依赖该波特率），行尾为
-CRLF。未连接接收机或连续 100 ms 没有合法帧时，`online` 为 `0`。
+`VX/VY`放大1000后表示mm/s，`WZ/OFF`放大1000后表示mrad/s和mrad。
+原始通道正常约`364~1684`、回中约`1024`；去中心通道正常约
+`-660~+660`。S1/S2编码为上=`1`、下=`2`、中=`3`。
 
 ## BMI088原始数据与Pitch融合诊断
 
@@ -170,12 +166,11 @@ CRLF。未连接接收机或连续 100 ms 没有合法帧时，`online` 为 `0`�
 - 陀螺仪：`±1000 °/s`、1000 Hz ODR、116 Hz带宽；
 - 温度约每秒读取一次，单位为毫摄氏度。
 
-USB CDC每20 ms发送一行，原始数据和Pitch融合数据交替输出，因此两种
-格式各约25 Hz：
+USART6调试任务以约7.1 Hz分别输出原始数据和Pitch融合数据：
 
 ```text
-IMU_RAW,count,ax,ay,az,gx,gy,gz,temp_mC,error_count\r\n
-PITCH_FUSION,S=状态,CAL=标定样本,AR=原始重力角,AA=对齐重力角,G=陀螺角速度,E=编码器角度,ER=编码器角速度,F=融合角度,FR=融合角速度,B=安装架扰动角速度,I=加速度创新量,R=恢复样本数,H=健康位\r\n
+IMU_RAW,T=时间,N=样本数,AX=...,AY=...,AZ=...,GX=...,GY=...,GZ=...,TEMP=毫摄氏度,ERR=读取错误,TXE=串口错误\r\n
+PITCH_FUSION,T=时间,S=状态,SC=IMU样本,FC=融合次数,CAL=标定样本,AR=原始重力角,AA=对齐重力角,G=陀螺角速度,GB=Kalman零偏,N=加速度模长,E=编码器角度,ER=编码器角速度,F=融合角度,FR=融合角速度,B=安装架扰动角速度,I=创新量,TC=反馈电流,CMD=实际命令,PID=PID输出,FF=前馈,R=恢复样本,H=健康位,RP=恢复等待,TXE=串口错误\r\n
 ```
 
 其中六轴字段均为有符号16位原始值。换算关系约为：
@@ -189,7 +184,29 @@ temperature_C = temp_mC / 1000
 静止平放时，三个加速度轴中应有一个轴接近 `±5460`，其余接近0；
 三个陀螺仪轴应接近0。`count` 应持续递增，正常时
 `error_count` 应保持0。`PITCH_FUSION`中的角度和角速度均放大100倍后
-以整数发送，例如`F=1234`表示融合Pitch为`12.34°`。
+以整数发送，例如`F=1234`表示融合Pitch为`12.34°`。`GB`同样放大100倍；
+`TC/CMD/FF`使用GM6020原始电流命令单位，可直接用于重力前馈辨识。
+
+Yaw位置对比通过`POSITION`行约50 Hz输出：
+
+```text
+POSITION,T=时间,Y_ACT=Yaw实际位置,Y_REF=Yaw理论位置,
+Y_AOK=实际位置有效,Y_ROK=理论位置有效,Y_ASRC=实际位置来源,
+Y_RSRC=理论位置来源,Y_MODE=控制模式,TXE=串口错误\r\n
+```
+
+位置均放大100倍，例如`Y_ACT=1234`表示`12.34°`。`Y_RSRC=1`表示
+位置环内部目标，`Y_RSRC=2`表示纯速度环下由目标RPM积分得到的仅供绘图
+理论轨迹；后者不参与电机控制。`Y_MODE=0`表示位置环，`1`表示纯速度环。
+默认只发送Yaw；把`Core/Inc/uart_debug.h`中的
+`UART_DEBUG_PITCH_POSITION_ENABLE`改为`1U`后，同一行会追加
+`P_ACT/P_REF/P_AOK/P_ROK/P_ASRC/P_RSRC/P_MODE`。Pitch实际位置来源
+`P_ASRC=1`表示编码器，`2`表示融合反馈。
+
+云台与速度环数据通过`GIMBAL`行约14.3 Hz输出。`YP/PP`为放大100倍的
+角度，`YT/PT`和`YER/PER`为放大100倍的目标RPM与速度误差；
+`YC/PC`为实际CAN电流命令，`YTC/PTC`为电机反馈电流，
+`YM/PM`中`0`表示位置环、`1`表示纯速度环。
 
 融合状态`S`：
 
@@ -209,9 +226,11 @@ temperature_C = temp_mC / 1000
 如果实机方向不一致，只修改
 `Core/Inc/config/pitch_fusion_config.h`中的轴索引和方向。
 
-Pitch融合使用编码器建立机械零位与IMU安装角偏差，运行中用陀螺
-积分预测、用可信的重力角低频修正。`B = FR - ER`用于观察底盘或安装架
-对Pitch轴的扰动。以下闭环保护参数已经保留，但只有把
+Pitch融合使用编码器建立机械零位与IMU安装角偏差，运行中使用二维
+Kalman同时估计惯性Pitch角和陀螺零偏：陀螺负责预测，可信重力角负责
+观测更新。`B = FR - ER`用于观察底盘或安装架对Pitch轴的扰动。
+Kalman的`Q/R/P0`参数集中在`pitch_fusion_config.h`。以下闭环保护参数
+已经保留，但只有把
 `PITCH_FUSION_CONTROL_ENABLE`改为`1U`后才生效：
 
 - 控制用融合角相对编码器角最多偏离`±5°`；
@@ -235,14 +254,14 @@ IMU,CONFIG_ERROR,ACC=0x1E,GYRO=0x0F,CFG=GYRO:0x10,W=0x02,R=0x82,ERR=0
 
 ## DBUS 云台控制
 
-当前`GIMBAL_YAW_ONLY_TEST_MODE=0U`，启用Yaw和Pitch双轴控制。以上板
-开发板为视角，Yaw通过CAN1、Pitch通过CAN2通信，两台GM6020均为ID 2。
-上电分别采集100帧零点后，CH0控制Yaw、CH1控制Pitch：
+当前`GIMBAL_YAW_ONLY_TEST_MODE=0U`，启用Yaw和Pitch双轴位置控制。
+以上板开发板为视角，Yaw通过CAN1、Pitch通过CAN2通信，两台
+GM6020均为ID 2。上电分别采集100帧零点后，CH0控制Yaw、CH1控制Pitch：
 
 | 通道 | 动作 | 满杆目标速度 |
 | --- | --- | --- |
-| `CH0` | Yaw 左右运动 | `360°/s` |
-| `CH1` | Pitch 上下运动 | `30°/s` |
+| `CH0` | Yaw 左右运动 | `180°/s` |
+| `CH1` | Pitch 上下运动 | `60°/s` |
 
 两个通道都使用`±30`死区，回中后各自保持目标角度。Yaw使用多圈位置
 目标，范围为`±36000°`；Pitch使用单圈位置目标并限制在
@@ -251,31 +270,139 @@ IMU,CONFIG_ERROR,ACC=0x1E,GYRO=0x0F,CFG=GYRO:0x10,W=0x02,R=0x82,ERR=0
 标定状态：Yaw离线不影响Pitch，Pitch离线不影响Yaw；恢复的轴从自己的
 编码器当前位置重新接管，避免跳回旧目标。
 
-当前实机方向修正为Yaw `+1.0f`、Pitch `-1.0f`。如果后续更改电机安装
+当前实机方向修正为Yaw `-1.0f`、Pitch `-1.0f`。如果后续更改电机安装
 方向，可修改`remote_gimbal_control.c`中的
 `REMOTE_GIMBAL_YAW_DIRECTION`或`REMOTE_GIMBAL_PITCH_DIRECTION`。
 需要重新进行Yaw单轴测试时，可暂时把
 `GIMBAL_YAW_ONLY_TEST_MODE`改回`1U`。
 
+遥控位置轨迹同时提交目标速度前馈，首次装机时Yaw/Pitch增益均为保守的
+`0.25`；确认方向和电流响应后再按`0.25 → 0.5 → 1.0`逐步增加。到达
+软件限位时按实际目标增量计算，向限位外的速度前馈自动变为0。速度前馈
+与角度PID之和统一执行目标转速限幅。速度环还预留以下模型电流前馈：
+
+```text
+Iff = A*sin(angle) + B*cos(angle) + C
+    + Ks*friction(speed) + Kv*speed + Ka*acceleration
+```
+
+重力、摩擦、速度、加速度及Pitch底座扰动前馈系数当前均为0，必须使用
+实机日志辨识后在`gimbal_params.h`中逐项启用。PID与前馈的总电流统一
+限幅并参与anti-windup；急停、故障、速度调试模式和反馈源切换都会清空
+旧前馈。
+
 当前还启用了临时S1安全映射：
 
 | S1挡位 | 动作 |
 | --- | --- |
-| 上挡 | 锁存云台GM6020急停，并令CAN1底盘零速、软件断电 |
-| 中挡 | 解除云台与底盘急停 |
-| 下挡 | 解除云台与底盘急停 |
+| 上挡 | 锁存云台、底盘、摩擦轮和拨弹盘急停，立即归零 |
+| 中挡 | 解除四模块急停；摩擦轮和拨弹盘保持关闭 |
+| 下挡 | 解除四模块急停并启动双摩擦轮；底盘保持可控 |
 
 S1上挡具有持续优先权；上挡期间即使USB收到`CLEAR`，也会在下一控制
 周期重新急停。中/下挡只在切换进入该挡位时解除一次，不会持续覆盖
 USB的`ESTOP`。该映射标记为临时设置，后续可以重新分配S1功能。
 
-S2用于选择底盘模式：
+S2始终用于选择底盘模式；S1在下挡时，S2同时选择拨弹盘动作：
 
 | S2挡位 | `0x301`模式值 | 底盘模式 |
 | --- | --- | --- |
 | 上挡 | `1` | 跟随模式 |
 | 中挡 | `2` | 不跟随模式 |
 | 下挡 | `3` | 小陀螺模式 |
+
+## CAN2双C620/M3508摩擦轮
+
+两台摩擦轮使用CAN2上的C620电调ID 1和ID 2。反馈标准帧为`0x201`和
+`0x202`，由过滤器组15以16位列表模式精确路由到FIFO1；Pitch GM6020
+`0x206`仍由过滤器组14路由到FIFO0。控制使用标准帧`0x200`：
+
+| C620 ID | 反馈ID | 电流槽位 | 逻辑方向 |
+| --- | --- | --- | --- |
+| 1 | `0x201` | `DATA[0:1]` | `+1` |
+| 2 | `0x202` | `DATA[2:3]` | `-1` |
+
+逻辑正转统一定义为发射方向，ID2在反馈和输出两侧同时取反，因此两个
+速度环可使用相同的正目标转速。首次验证参数位于
+`Core/Inc/config/dual_m3508_params.h`：
+
+```text
+目标转速       100 rpm
+目标速度斜坡   200 rpm/s
+速度环         Kp=5，Ki=0，Kd=0
+电流硬限幅     ±3000 raw（约±3.66 A转矩电流）
+电流变化率     50 raw/ms
+反馈超时       50 ms
+到速条件       两轮误差均≤15 rpm并持续200 ms
+过温阈值       80℃
+堵转判定       |速度|≤5 rpm且|逻辑命令|≥400持续1000 ms
+```
+
+S1下挡请求启动双摩擦轮。上电、DBUS掉线重连或急停解除后必须先经过
+S1中挡，保持S1下挡时单独发送USB `CLEAR`不会自动重新启动。任一
+电机反馈超时、过温或堵转都会锁存成对故障并立即发送双零电流。故障
+后必须回到S1中挡，等待两台电机在线且接近静止100 ms，再重新进入
+S1下挡。
+
+USART6约7.1 Hz输出：
+
+```text
+FRICTION,T=时间,INIT=初始化,EN=运行请求,ST=状态,RDY=双机到速,
+EST=急停,FLT=故障锁存,FR=故障原因,TGT=目标转速×100,
+M1/M2的ON、ANG、RAW原始转速、RPM逻辑转速、E速度误差、
+CMD命令电流、ACT反馈电流、TMP温度、AGE反馈年龄,TXE,UTE\r\n
+```
+
+## C610/M2006拨弹盘方向测试
+
+拨弹盘使用CAN1上的C610电调ID 3。反馈标准帧为`0x203`，由过滤器组1
+精确路由到FIFO1；Yaw `0x206`仍使用FIFO0，因此两个模块不会互相取走
+反馈。控制使用标准帧`0x200`，ID 3电流命令位于`DATA[4:5]`，其余
+ID 1/2/4槽位保持0。
+
+临时遥控组合：
+
+| S1 | S2 | 拨弹盘动作 |
+| --- | --- | --- |
+| 上 | 任意 | 急停并立即归零 |
+| 中 | 任意 | 拨弹盘关闭，遥控器恢复原云台/底盘用途 |
+| 下 | 上 | 立即启动方向A拨弹，目标`+3000 rpm` |
+| 下 | 中 | 拨弹盘零电流；保持100 ms且电机接近静止后解锁 |
+| 下 | 下 | 拨弹盘零电流，不提供方向B入口 |
+
+上电、遥控掉线、急停、反馈超时、故障和方向切换后都必须重新经过
+`S1下+S2中`。拨弹盘运行时底盘不再强制
+`CHASSIS_MODE_SOFTWARE_OFF`，左摇杆仍可控制底盘平移；S2会同时选择
+底盘模式和拨弹盘动作。当前拨弹盘不再检查摩擦轮`RDY`状态，只要
+`S1下+S2上`就启动方向A。
+
+首次参数位于`Core/Inc/config/feeder_params.h`：
+
+```text
+目标速度       ±3000 rpm
+目标速度斜坡   500 rpm/s
+速度环         Kp=7，Ki=8，Kd=0
+积分项限幅     ±1000
+电流硬限幅     ±6000（约±6 A）
+电流变化率     200 raw/ms
+反馈超时       50 ms
+堵转判定       |速度|≤5 rpm且|命令|≥400持续500 ms
+```
+
+停止状态直接输出零电流而不主动反向制动。C610错误码非0或软件堵转会
+锁存故障；错误消失并重新保持中挡100 ms后才能解锁。首次使用或更换
+C610/M2006后，应先按照电调说明书空载完成电机校准，并确认CAN1上没有
+第二个ID 3设备。
+
+USART6约7.1 Hz输出：
+
+```text
+FEEDER,T=时间,INIT=初始化,ON=在线,SEQ=反馈帧数,ST=状态,RC=遥控命令,
+ARM=已解锁,EST=急停,FLT=故障锁存,FR=故障原因,ANG=角度,RPM=转速,
+TGT=目标转速×100,E=速度误差,P=比例项,I=积分项,D=微分项,
+OUT=PID限幅后输出,CMD=斜坡后命令电流,ACT=反馈电流,ERR=C610错误码,
+AGE=反馈年龄,TXE=CAN发送错误,UTE=串口发送错误\r\n
+```
 
 ## 底盘CAN1协议
 
@@ -309,19 +436,24 @@ CAN1与Yaw电机共享物理总线；底盘模块每10 ms发送两帧，不接�
 | 路径 | 用途 |
 | --- | --- |
 | `Core/Src/main.c` | 外设、业务模块及 FreeRTOS 内核初始化 |
-| `Core/Src/freertos.c` | 1 ms云台控制任务、1 ms IMU采集任务及RTOS故障钩子 |
+| `Core/Src/freertos.c` | 1 ms云台任务、1 ms IMU任务、10 ms USART6调试任务及RTOS钩子 |
 | `Core/Src/bmi088.c` | BMI088初始化、寄存器配置和六轴原始数据采集 |
-| `Core/Src/bmi088_monitor.c` | USB CDC BMI088原始数据、Pitch融合与故障输出 |
-| `Core/Src/pitch_fusion.c` | Pitch静止标定、互补滤波和受限闭环反馈 |
+| `Core/Src/uart_debug.c` | USART6云台、RC、底盘、BMI088及Pitch融合统一调试输出 |
+| `Core/Src/bmi088_monitor.c` | 保留的USB CDC BMI088旧监视模块，当前任务未调用 |
+| `Core/Src/pitch_fusion.c` | Pitch静止标定、二维Kalman和受限闭环反馈 |
 | `Core/Src/control_input.c` | USB CDC双轴串口指令解析 |
 | `Core/Src/dbus.c` | DBUS DMA接收、摇杆解包、校验与在线判断 |
-| `Core/Src/dbus_monitor.c` | 20 Hz USB CDC遥控器调试输出 |
+| `Core/Src/dbus_monitor.c` | 保留的USB CDC遥控器旧监视模块，当前任务未调用 |
 | `Core/Src/remote_gimbal_control.c` | DBUS摇杆死区、速度映射与目标位置积分 |
 | `Core/Src/gimbal_calibration.c` | 上电采样、传感器零位设置及Pitch慢速回零 |
 | `Core/Src/chassis_can.c` | CAN1底盘双帧编码和周期发送 |
-| `Core/Src/motor_control.c` | 双轴状态机、Pitch融合反馈、PID和CAN控制 |
-| `Core/Inc/config/gimbal_params.h` | PID、零位、限位和超时参数 |
-| `Core/Inc/config/pitch_fusion_config.h` | Pitch融合、传感器零位及慢速回零参数 |
+| `Core/Src/dual_m3508.c` | CAN2双C620/M3508反馈、速度环及成对安全状态机 |
+| `Core/Src/feeder_motor.c` | CAN1 C610 ID3反馈、速度PID及拨弹盘安全状态机 |
+| `Core/Src/motor_control.c` | 双轴状态机、Pitch融合反馈、PID、前馈和CAN控制 |
+| `Core/Inc/config/feeder_params.h` | 拨弹盘ID、低速测试、电流和堵转保护参数 |
+| `Core/Inc/config/dual_m3508_params.h` | 双摩擦轮ID、方向、PID及安全参数 |
+| `Core/Inc/config/gimbal_params.h` | PID、前馈、零位、限位和超时参数 |
+| `Core/Inc/config/pitch_fusion_config.h` | Pitch Kalman、传感器零位及慢速回零参数 |
 | `CAN.ioc` | STM32CubeMX工程 |
 
 架构图：
@@ -343,7 +475,7 @@ cmake --build --preset Debug --target CAN
 
 ## 使用前配置
 
-1. 在 `Core/Inc/config/gimbal_params.h` 中设置两轴PID参数。
+1. 在 `Core/Inc/config/gimbal_params.h` 中设置两轴PID和已辨识的前馈参数。
 2. 标定 `YAW_ZERO_OFFSET_DEG` 和 `PITCH_ZERO_OFFSET_DEG`。
 3. 根据机械结构设置Yaw、Pitch软限位。
 4. 检查 `Core/Inc/config/pitch_fusion_config.h`中的BMI088轴向、Pitch

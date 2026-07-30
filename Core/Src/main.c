@@ -32,21 +32,24 @@
  * 项目自定义模块：
  *   chassis_can.h  — CAN1 底盘控制命令发送 (Chassis CAN1 command transmission)
  *   control_input.h — USB CDC 双轴串口控制入口 (USB CDC serial control interface)
- *   dbus_monitor.h — DBUS 数据 USB CDC 调试输出
+ *   dual_m3508.h — CAN2双C620/M3508摩擦轮控制
+ *   feeder_motor.h — CAN1 C610 ID3 / M2006拨弹盘控制
  *   gimbal_calibration.h — 双轴上电自动机械零位采样
  *   motor_control.h — 双轴 GM6020 电机串级 PID 控制 (GM6020 cascaded PID control)
  *   remote_gimbal_control.h — DBUS 摇杆到双轴云台位置目标的映射
+ *   uart_debug.h — USART6统一调试数据输出
  */
 #include "chassis_can.h"
 #include "bmi088.h"
-#include "bmi088_monitor.h"
 #include "control_input.h"
 #include "dbus.h"
-#include "dbus_monitor.h"
+#include "dual_m3508.h"
+#include "feeder_motor.h"
 #include "gimbal_calibration.h"
 #include "motor_control.h"
 #include "pitch_fusion.h"
 #include "remote_gimbal_control.h"
+#include "uart_debug.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -156,6 +159,26 @@ int main(void)
   GimbalCalibration_Init();
 
   /*
+   * 初始化CAN2上的双C620/M3508摩擦轮：
+   *   ID1/ID2反馈0x201/0x202 -> 过滤器组15 -> FIFO1；
+   *   控制帧0x200的DATA[0:3]，上电默认双零电流。
+   */
+  if (DualM3508_Init(&hcan2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /*
+   * 初始化CAN1上的C610 ID3拨弹盘：
+   *   过滤器组1 -> FIFO1 -> 反馈0x203；
+   *   控制帧0x200的DATA[4:5]，上电默认零电流且必须中挡重新解锁。
+   */
+  if (FeederMotor_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /*
    * 初始化 CAN1 底盘发送通道。CAN1 已由 Yaw 电机模块启动时直接复用；
    * 底盘 0x300/0x301 与 Yaw 0x206/0x1FE 不冲突。
    */
@@ -176,11 +199,14 @@ int main(void)
 
   /*
    * BMI088最小通信验证：分别读取加速度计和陀螺仪CHIP_ID。
-   * 读取失败不阻止云台工作，诊断结果由USB CDC周期输出。
+   * 读取失败不阻止云台工作，诊断结果由USART6调试任务周期输出。
   */
   (void)BMI088_Init(&hspi1);
   PitchFusion_Init();
-  BMI088_Monitor_Init();
+  if (UART_Debug_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
 #if SPEED_LOOP_DEBUG_BOOT_ENABLE
   /*

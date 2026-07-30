@@ -63,10 +63,24 @@
 #define PITCH_FUSION_ACCEL_INNOVATION_MAX_DEG         12.0f
 
 /*
- * 互补滤波时间常数。值越大越信任陀螺仪，值越小越快跟随重力角。
- * 0.5 s 在 1 kHz 下对应每拍约 0.2% 的重力角修正。
+ * 二维Kalman状态：[惯性Pitch角度(deg), 陀螺零偏(deg/s)]。
+ *
+ * PROCESS_ANGLE_NOISE_DEG2:
+ *   每次预测附加到角度协方差的离散过程噪声。当前4e-6与1deg²
+ *   加速度观测噪声组合后，1 kHz稳态角度修正增益约为0.002，
+ *   与原0.5 s互补滤波的低频修正速度接近。
+ *
+ * PROCESS_BIAS_NOISE_DPS2:
+ *   每次预测附加到陀螺零偏协方差的随机游走噪声。
+ *
+ * ACCEL_MEASUREMENT_NOISE_DEG2:
+ *   可信加速度重力角的观测噪声方差。实机应使用静止日志方差替换。
  */
-#define PITCH_FUSION_ACCEL_CORRECTION_TAU_S            0.50f
+#define PITCH_KALMAN_PROCESS_ANGLE_NOISE_DEG2      0.000004f
+#define PITCH_KALMAN_PROCESS_BIAS_NOISE_DPS2      0.00000001f
+#define PITCH_KALMAN_ACCEL_MEASUREMENT_NOISE_DEG2       1.0f
+#define PITCH_KALMAN_INITIAL_ANGLE_VARIANCE_DEG2       0.01f
+#define PITCH_KALMAN_INITIAL_BIAS_VARIANCE_DPS2        0.01f
 
 /* 数据新鲜度与积分步长保护。 */
 #define PITCH_FUSION_IMU_TIMEOUT_MS                   20U

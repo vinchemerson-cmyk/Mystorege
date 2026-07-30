@@ -66,6 +66,9 @@ HAL_StatusTypeDef ChassisCAN_Init(CAN_HandleTypeDef *hcan);
 /* 更新下一周期要发送的底盘命令。 */
 bool ChassisCAN_SetCommand(const Chassis_Ctrl_Cmd_s *command);
 
+/* 获取当前待发送命令快照，供低优先级调试任务读取。 */
+bool ChassisCAN_GetCommand(Chassis_Ctrl_Cmd_s *command);
+
 /*
  * 锁存式急停：立即请求发送零速度和软件断电模式。
  * 急停锁存期间 ChassisCAN_SetCommand() 拒绝普通控制命令。
@@ -77,6 +80,9 @@ HAL_StatusTypeDef ChassisCAN_EmergencyStop(void);
  * 必须再调用 ChassisCAN_SetCommand() 才能恢复底盘动作。
  */
 void ChassisCAN_ClearEmergencyStop(void);
+
+/* 查询底盘急停锁存状态。 */
+bool ChassisCAN_IsEmergencyStopped(void);
 
 /* 主循环周期调用，默认每10 ms发送一次。 */
 void ChassisCAN_Process(void);
