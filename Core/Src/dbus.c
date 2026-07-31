@@ -183,11 +183,13 @@ bool DBUS_ReadRawFrame(uint8_t frame[DBUS_FRAME_LENGTH])
  *   CH2 = byte2[7:6] + byte3[7:0] + byte4[0]
  *   CH3 = byte4[7:1] + byte5[3:0]
  * S1/S2 分别位于 byte5 的 bit[7:6] / bit[5:4]。
+ * 拨轮 = byte16[7:0] + byte17[2:0]，同样为11 bit。
  */
 bool DBUS_Process(void)
 {
   uint8_t frame[DBUS_FRAME_LENGTH];
   uint16_t channel[DBUS_CHANNEL_COUNT];
+  uint16_t dial;
   uint8_t switch_value[2];
   uint32_t index;
   const uint32_t now = HAL_GetTick();
@@ -215,6 +217,10 @@ bool DBUS_Process(void)
 
     switch_value[0] = (frame[5] >> 6U) & 0x03U;
     switch_value[1] = (frame[5] >> 4U) & 0x03U;
+    dial =
+        ((uint16_t)frame[16]
+         | ((uint16_t)frame[17] << 8U))
+        & 0x07FFU;
 
     ++dbus_data.frame_count;
     if (DBUS_FieldsAreValid(channel, switch_value))
@@ -227,6 +233,11 @@ bool DBUS_Process(void)
       }
       dbus_data.switch_value[0] = switch_value[0];
       dbus_data.switch_value[1] = switch_value[1];
+      dbus_data.dial = dial;
+      dbus_data.centered_dial =
+          (int16_t)dial - (int16_t)DBUS_DIAL_CENTER;
+      dbus_data.dial_valid =
+          (dial >= DBUS_DIAL_MIN) && (dial <= DBUS_DIAL_MAX);
       ++dbus_data.valid_frame_count;
       dbus_data.last_valid_frame_ms = now;
       dbus_data.last_frame_valid = true;
@@ -236,6 +247,7 @@ bool DBUS_Process(void)
     {
       ++dbus_data.invalid_frame_count;
       dbus_data.last_frame_valid = false;
+      dbus_data.dial_valid = false;
     }
   }
 
@@ -244,6 +256,7 @@ bool DBUS_Process(void)
           > DBUS_OFFLINE_TIMEOUT_MS))
   {
     dbus_data.online = false;
+    dbus_data.dial_valid = false;
   }
 
   return frame_available;

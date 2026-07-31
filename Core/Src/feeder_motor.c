@@ -1,7 +1,7 @@
 /**
  * ===========================================================================
  * @file    feeder_motor.c
- * @brief   CAN1 C610 ID3 / M2006拨弹盘速度PID控制模块
+ * @brief   CAN1 C610 ID3 / M2006拨弹盘速度/单发位置控制模块
  * ===========================================================================
  *
  * CAN协议：
@@ -11,7 +11,9 @@
  * 安全策略：
  *   - 上电、急停、遥控掉线和方向切换后必须在中挡保持100 ms重新解锁；
  *   - 重新解锁还要求反馈在线、C610错误码为0且电机接近静止；
- *   - 方向A已确认为拨弹方向，速度环使用带anti-windup的PID；
+ *   - 连发/退弹使用速度环；单发使用位置外环串接同一个速度内环；
+ *   - 单发按36:1减速比和每圈10发计算固定步距，先小幅超转再回退
+ *     到整发落点；
  *   - 反馈超时、C610错误码或软件堵转保护立即输出零电流；
  *   - 停止时不主动反向制动，避免C610回生电压抬升。
  * ===========================================================================
@@ -35,14 +37,21 @@ typedef struct
   float speed_integral_raw;
   float previous_speed_error_rpm;
   float filtered_derivative_rpm_s;
-  FeederRemoteCommand_t active_direction;
+  int64_t single_target_scaled_ecd;
+  int64_t single_final_target_scaled_ecd;
+  FeederRemoteCommand_t active_command;
   uint32_t last_process_ms;
   uint32_t last_tx_ms;
   uint32_t neutral_start_ms;
   uint32_t stall_start_ms;
+  uint32_t single_settle_start_ms;
   int16_t last_sent_current_raw;
+  uint16_t previous_encoder;
   bool neutral_timing;
   bool stall_timing;
+  bool single_request_pending;
+  bool single_settle_timing;
+  bool encoder_initialized;
   bool speed_pid_initialized;
   bool initialized;
 } FeederMotorContext_t;
@@ -62,19 +71,19 @@ static float clamp_float(float value, float minimum, float maximum)
   return value;
 }
 
-static int16_t clamp_current(float value)
+static int16_t clamp_current(float value, int16_t limit_raw)
 {
   if (!isfinite(value))
   {
     return 0;
   }
-  if (value > (float)FEEDER_CURRENT_LIMIT_RAW)
+  if (value > (float)limit_raw)
   {
-    return FEEDER_CURRENT_LIMIT_RAW;
+    return limit_raw;
   }
-  if (value < (float)-FEEDER_CURRENT_LIMIT_RAW)
+  if (value < (float)-limit_raw)
   {
-    return -FEEDER_CURRENT_LIMIT_RAW;
+    return (int16_t)-limit_raw;
   }
   return (int16_t)((value >= 0.0f)
       ? (value + 0.5f)
@@ -132,8 +141,9 @@ static void reset_speed_pid(void)
 }
 
 static float update_speed_pid(float target_speed_rpm,
-                              float feedback_speed_rpm,
-                              uint32_t delta_ms)
+                               float feedback_speed_rpm,
+                               uint32_t delta_ms,
+                               int16_t current_limit_raw)
 {
   const float delta_s = (float)delta_ms / 1000.0f;
   const float error = target_speed_rpm - feedback_speed_rpm;
@@ -184,14 +194,14 @@ static float update_speed_pid(float target_speed_rpm,
    * 输出未饱和时正常积分；输出饱和时，仅允许积分向解除饱和的方向变化。
    * 这样堵转或启动大误差不会让积分项持续累积。
    */
-  if (((candidate_output < (float)FEEDER_CURRENT_LIMIT_RAW)
+  if (((candidate_output < (float)current_limit_raw)
        && (candidate_output
-           > (float)-FEEDER_CURRENT_LIMIT_RAW))
+           > (float)-current_limit_raw))
       || ((candidate_output
-           >= (float)FEEDER_CURRENT_LIMIT_RAW)
+           >= (float)current_limit_raw)
           && (error < 0.0f))
       || ((candidate_output
-           <= (float)-FEEDER_CURRENT_LIMIT_RAW)
+           <= (float)-current_limit_raw)
           && (error > 0.0f)))
   {
     feeder.speed_integral_raw = candidate_integral;
@@ -199,8 +209,8 @@ static float update_speed_pid(float target_speed_rpm,
 
   output = clamp_float(
       p_term + feeder.speed_integral_raw + d_term,
-      (float)-FEEDER_CURRENT_LIMIT_RAW,
-      (float)FEEDER_CURRENT_LIMIT_RAW);
+      (float)-current_limit_raw,
+      (float)current_limit_raw);
   feeder.previous_speed_error_rpm = error;
   feeder.debug.speed_error_rpm = error;
   feeder.debug.pid_p_raw = p_term;
@@ -275,9 +285,38 @@ static void force_zero_output(void)
   feeder.ramped_target_speed_rpm = 0.0f;
   feeder.debug.target_speed_rpm = 0.0f;
   feeder.debug.command_current_raw = 0;
-  feeder.active_direction = FEEDER_REMOTE_DISABLE;
+  feeder.active_command = FEEDER_REMOTE_DISABLE;
+  feeder.debug.single_shot_active = false;
+  feeder.debug.single_returning = false;
   feeder.stall_timing = false;
+  feeder.single_settle_timing = false;
   reset_speed_pid();
+}
+
+static void update_multi_turn_position(uint16_t encoder)
+{
+  int32_t delta;
+
+  if (!feeder.encoder_initialized)
+  {
+    feeder.previous_encoder = encoder;
+    feeder.debug.total_angle_ecd = encoder;
+    feeder.encoder_initialized = true;
+    return;
+  }
+
+  delta = (int32_t)encoder - (int32_t)feeder.previous_encoder;
+  if (delta > (FEEDER_ENCODER_CPR / 2))
+  {
+    delta -= FEEDER_ENCODER_CPR;
+  }
+  else if (delta < -(FEEDER_ENCODER_CPR / 2))
+  {
+    delta += FEEDER_ENCODER_CPR;
+  }
+
+  feeder.debug.total_angle_ecd += delta;
+  feeder.previous_encoder = encoder;
 }
 
 static void parse_feedback(
@@ -297,6 +336,7 @@ static void parse_feedback(
 
   feeder.debug.angle =
       (uint16_t)(((uint16_t)data[0] << 8U) | data[1]);
+  update_multi_turn_position(feeder.debug.angle);
   feeder.debug.speed_rpm =
       (int16_t)(((uint16_t)data[2] << 8U) | data[3]);
   feeder.debug.actual_current_raw =
@@ -383,9 +423,130 @@ static void update_rearm_state(uint32_t now)
     feeder.debug.fault_latched = false;
     feeder.debug.fault_reason = FEEDER_FAULT_NONE;
     feeder.debug.armed = true;
-    feeder.active_direction = FEEDER_REMOTE_DISABLE;
+    feeder.active_command = FEEDER_REMOTE_DISABLE;
     reset_neutral_timer();
   }
+}
+
+static int32_t clamp_int64_to_int32(int64_t value)
+{
+  if (value > INT32_MAX)
+  {
+    return INT32_MAX;
+  }
+  if (value < INT32_MIN)
+  {
+    return INT32_MIN;
+  }
+  return (int32_t)value;
+}
+
+static int64_t scaled_ecd_to_rounded_ecd(int64_t scaled_ecd)
+{
+  const int64_t divisor =
+      (int64_t)FEEDER_PROJECTILES_PER_OUTPUT_REV;
+
+  if (scaled_ecd >= 0)
+  {
+    return (scaled_ecd + divisor / 2) / divisor;
+  }
+  return (scaled_ecd - divisor / 2) / divisor;
+}
+
+static int64_t single_position_error_scaled(void)
+{
+  return feeder.single_target_scaled_ecd
+      - feeder.debug.total_angle_ecd
+        * (int64_t)FEEDER_PROJECTILES_PER_OUTPUT_REV;
+}
+
+static float single_position_error_output_deg(void)
+{
+  const int64_t error_scaled = single_position_error_scaled();
+  const float error_ecd =
+      (float)error_scaled
+      / (float)FEEDER_PROJECTILES_PER_OUTPUT_REV;
+
+  feeder.debug.position_error_ecd =
+      clamp_int64_to_int32(
+          scaled_ecd_to_rounded_ecd(error_scaled));
+  return error_ecd * 360.0f
+      / ((float)FEEDER_ENCODER_CPR
+         * (float)FEEDER_GEAR_RATIO);
+}
+
+static void update_single_debug_target(void)
+{
+  feeder.debug.target_total_angle_ecd =
+      scaled_ecd_to_rounded_ecd(
+          feeder.single_target_scaled_ecd);
+  feeder.debug.position_error_ecd =
+      clamp_int64_to_int32(
+          scaled_ecd_to_rounded_ecd(
+              single_position_error_scaled()));
+}
+
+static bool start_single_shot(void)
+{
+  const int64_t one_projectile_step_scaled =
+      (int64_t)FEEDER_ENCODER_CPR
+      * (int64_t)FEEDER_GEAR_RATIO;
+  const int64_t overshoot_scaled =
+      (one_projectile_step_scaled
+       * (int64_t)FEEDER_SINGLE_OVERSHOOT_PERCENT
+       + 50)
+      / 100;
+
+  if (!feeder.encoder_initialized)
+  {
+    return false;
+  }
+
+  feeder.single_final_target_scaled_ecd =
+      feeder.debug.total_angle_ecd
+        * (int64_t)FEEDER_PROJECTILES_PER_OUTPUT_REV
+      + one_projectile_step_scaled;
+  feeder.single_target_scaled_ecd =
+      feeder.single_final_target_scaled_ecd
+      + overshoot_scaled;
+  update_single_debug_target();
+  feeder.debug.single_shot_active = true;
+  feeder.debug.single_returning = false;
+  feeder.active_command = FEEDER_REMOTE_SINGLE;
+  feeder.debug.state = FEEDER_STATE_RUNNING_SINGLE;
+  feeder.single_settle_timing = false;
+  feeder.ramped_target_speed_rpm = 0.0f;
+  reset_speed_pid();
+  return true;
+}
+
+static void begin_single_return(void)
+{
+  /*
+   * 已确认拨盘越过整发落点后，先撤销正向电流，再把目标切回整发落点。
+   * 下一控制周期会产生小幅反向速度，使弹丸离开临界位置，同时目标
+   * 仍与触发瞬间相差严格一个弹位。
+   */
+  feeder.single_target_scaled_ecd =
+      feeder.single_final_target_scaled_ecd;
+  update_single_debug_target();
+  feeder.debug.single_returning = true;
+  feeder.single_settle_timing = false;
+  feeder.ramped_target_speed_rpm = 0.0f;
+  feeder.debug.target_speed_rpm = 0.0f;
+  feeder.debug.command_current_raw = 0;
+  reset_speed_pid();
+}
+
+static void finish_single_shot(void)
+{
+  ++feeder.debug.shot_count;
+  force_zero_output();
+  feeder.debug.position_error_ecd =
+      clamp_int64_to_int32(
+          scaled_ecd_to_rounded_ecd(
+              single_position_error_scaled()));
+  feeder.debug.state = FEEDER_STATE_ARMED_NEUTRAL;
 }
 
 static void update_safety_state(uint32_t now)
@@ -395,6 +556,8 @@ static void update_safety_state(uint32_t now)
           > FEEDER_FEEDBACK_TIMEOUT_MS))
   {
     feeder.debug.online = false;
+    feeder.encoder_initialized = false;
+    feeder.single_request_pending = false;
     disarm_for_neutral();
   }
 
@@ -433,6 +596,7 @@ static void update_safety_state(uint32_t now)
 
   if (feeder.debug.remote_command == FEEDER_REMOTE_DISABLE)
   {
+    feeder.single_request_pending = false;
     disarm_for_neutral();
     feeder.debug.state = FEEDER_STATE_DISABLED;
     return;
@@ -440,6 +604,7 @@ static void update_safety_state(uint32_t now)
 
   if (!feeder.debug.online)
   {
+    feeder.single_request_pending = false;
     disarm_for_neutral();
     feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
     return;
@@ -464,12 +629,30 @@ static void update_safety_state(uint32_t now)
     return;
   }
 
+  /*
+   * 单发一旦启动，即使自复位拨轮马上回中，也必须完成当前固定步距。
+   * DISABLE已在前面处理；若中途请求连发或退弹，则立即停止并要求重新
+   * 经过NEUTRAL，禁止直接切换方向。
+   */
+  if (feeder.debug.state == FEEDER_STATE_RUNNING_SINGLE)
+  {
+    if ((feeder.debug.remote_command
+         == FEEDER_REMOTE_CONTINUOUS)
+        || (feeder.debug.remote_command
+            == FEEDER_REMOTE_REVERSE))
+    {
+      disarm_for_neutral();
+      feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
+    }
+    return;
+  }
+
   if (feeder.debug.remote_command == FEEDER_REMOTE_NEUTRAL)
   {
-    if ((feeder.active_direction
-         == FEEDER_REMOTE_DIRECTION_A)
-        || (feeder.active_direction
-            == FEEDER_REMOTE_DIRECTION_B))
+    if ((feeder.active_command
+         == FEEDER_REMOTE_CONTINUOUS)
+        || (feeder.active_command
+            == FEEDER_REMOTE_REVERSE))
     {
       disarm_for_neutral();
       feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
@@ -482,19 +665,38 @@ static void update_safety_state(uint32_t now)
     return;
   }
 
+  if (feeder.debug.remote_command == FEEDER_REMOTE_SINGLE)
+  {
+    if (feeder.single_request_pending)
+    {
+      feeder.single_request_pending = false;
+      if (!start_single_shot())
+      {
+        disarm_for_neutral();
+        feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
+      }
+    }
+    else
+    {
+      force_zero_output();
+      feeder.debug.state = FEEDER_STATE_ARMED_NEUTRAL;
+    }
+    return;
+  }
+
   if ((feeder.debug.remote_command
-       != FEEDER_REMOTE_DIRECTION_A)
+       != FEEDER_REMOTE_CONTINUOUS)
       && (feeder.debug.remote_command
-          != FEEDER_REMOTE_DIRECTION_B))
+          != FEEDER_REMOTE_REVERSE))
   {
     disarm_for_neutral();
     feeder.debug.state = FEEDER_STATE_DISABLED;
     return;
   }
 
-  if ((feeder.active_direction
+  if ((feeder.active_command
        != FEEDER_REMOTE_DISABLE)
-      && (feeder.active_direction
+      && (feeder.active_command
           != feeder.debug.remote_command))
   {
     disarm_for_neutral();
@@ -502,11 +704,11 @@ static void update_safety_state(uint32_t now)
     return;
   }
 
-  feeder.active_direction = feeder.debug.remote_command;
+  feeder.active_command = feeder.debug.remote_command;
   feeder.debug.state =
-      (feeder.active_direction == FEEDER_REMOTE_DIRECTION_A)
-      ? FEEDER_STATE_RUNNING_A
-      : FEEDER_STATE_RUNNING_B;
+      (feeder.active_command == FEEDER_REMOTE_CONTINUOUS)
+      ? FEEDER_STATE_RUNNING_CONTINUOUS
+      : FEEDER_STATE_RUNNING_REVERSE;
 }
 
 static void update_stall_protection(uint32_t now)
@@ -514,8 +716,15 @@ static void update_stall_protection(uint32_t now)
   int32_t speed = feeder.debug.speed_rpm;
   int32_t current = feeder.debug.command_current_raw;
   const bool running =
-      (feeder.debug.state == FEEDER_STATE_RUNNING_A)
-      || (feeder.debug.state == FEEDER_STATE_RUNNING_B);
+      (feeder.debug.state == FEEDER_STATE_RUNNING_CONTINUOUS)
+      || (feeder.debug.state == FEEDER_STATE_RUNNING_SINGLE)
+      || (feeder.debug.state == FEEDER_STATE_RUNNING_REVERSE);
+  const bool single_far_from_target =
+      (feeder.debug.state != FEEDER_STATE_RUNNING_SINGLE)
+      || (feeder.debug.position_error_ecd
+          > FEEDER_SINGLE_POSITION_TOLERANCE_ECD)
+      || (feeder.debug.position_error_ecd
+          < -FEEDER_SINGLE_POSITION_TOLERANCE_ECD);
 
   if (speed < 0)
   {
@@ -527,6 +736,7 @@ static void update_stall_protection(uint32_t now)
   }
 
   if (running
+      && single_far_from_target
       && (speed <= FEEDER_STALL_SPEED_THRESHOLD_RPM)
       && (current >= FEEDER_STALL_CURRENT_THRESHOLD_RAW))
   {
@@ -555,8 +765,9 @@ static void update_control(uint32_t now)
 {
   uint32_t delta_ms =
       (uint32_t)(now - feeder.last_process_ms);
-  float desired_speed_rpm;
+  float desired_speed_rpm = 0.0f;
   float current_target;
+  int16_t current_limit_raw;
 
   feeder.last_process_ms = now;
   if (delta_ms == 0U)
@@ -568,17 +779,92 @@ static void update_control(uint32_t now)
     delta_ms = FEEDER_MAX_CONTROL_DELTA_MS;
   }
 
-  if ((feeder.debug.state != FEEDER_STATE_RUNNING_A)
-      && (feeder.debug.state != FEEDER_STATE_RUNNING_B))
+  if ((feeder.debug.state
+       != FEEDER_STATE_RUNNING_CONTINUOUS)
+      && (feeder.debug.state
+          != FEEDER_STATE_RUNNING_SINGLE)
+      && (feeder.debug.state
+          != FEEDER_STATE_RUNNING_REVERSE))
   {
     force_zero_output();
     return;
   }
 
-  desired_speed_rpm =
-      (feeder.debug.state == FEEDER_STATE_RUNNING_A)
-      ? FEEDER_TEST_TARGET_SPEED_RPM
-      : -FEEDER_TEST_TARGET_SPEED_RPM;
+  if (feeder.debug.state
+      == FEEDER_STATE_RUNNING_CONTINUOUS)
+  {
+    desired_speed_rpm = FEEDER_CONTINUOUS_SPEED_RPM;
+    current_limit_raw =
+        FEEDER_CONTINUOUS_CURRENT_LIMIT_RAW;
+    feeder.debug.target_total_angle_ecd =
+        feeder.debug.total_angle_ecd;
+    feeder.debug.position_error_ecd = 0;
+  }
+  else if (feeder.debug.state
+           == FEEDER_STATE_RUNNING_REVERSE)
+  {
+    desired_speed_rpm = -FEEDER_REVERSE_SPEED_RPM;
+    current_limit_raw =
+        FEEDER_REVERSE_CURRENT_LIMIT_RAW;
+    feeder.debug.target_total_angle_ecd =
+        feeder.debug.total_angle_ecd;
+    feeder.debug.position_error_ecd = 0;
+  }
+  else
+  {
+    const float position_error_output_deg =
+        single_position_error_output_deg();
+    int32_t speed = feeder.debug.speed_rpm;
+    int32_t position_error =
+        feeder.debug.position_error_ecd;
+
+    current_limit_raw =
+        FEEDER_SINGLE_CURRENT_LIMIT_RAW;
+    if (speed < 0)
+    {
+      speed = -speed;
+    }
+    if (position_error < 0)
+    {
+      position_error = -position_error;
+    }
+
+    if ((position_error
+         <= FEEDER_SINGLE_POSITION_TOLERANCE_ECD)
+        && (speed <= FEEDER_SINGLE_SETTLE_SPEED_RPM))
+    {
+      if (!feeder.single_settle_timing)
+      {
+        feeder.single_settle_start_ms = now;
+        feeder.single_settle_timing = true;
+      }
+      else if ((uint32_t)(
+                   now - feeder.single_settle_start_ms)
+               >= FEEDER_SINGLE_SETTLE_TIME_MS)
+      {
+        if (feeder.debug.single_returning)
+        {
+          finish_single_shot();
+        }
+        else
+        {
+          begin_single_return();
+        }
+        return;
+      }
+    }
+    else
+    {
+      feeder.single_settle_timing = false;
+    }
+
+    desired_speed_rpm = clamp_float(
+        FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG
+          * position_error_output_deg,
+        -FEEDER_SINGLE_MAX_SPEED_RPM,
+        FEEDER_SINGLE_MAX_SPEED_RPM);
+  }
+
   feeder.ramped_target_speed_rpm = ramp_speed(
       feeder.ramped_target_speed_rpm,
       desired_speed_rpm,
@@ -589,10 +875,11 @@ static void update_control(uint32_t now)
   current_target = update_speed_pid(
       feeder.ramped_target_speed_rpm,
       (float)feeder.debug.speed_rpm,
-      delta_ms);
+      delta_ms,
+      current_limit_raw);
   feeder.debug.command_current_raw = slew_current(
       feeder.debug.command_current_raw,
-      clamp_current(current_target),
+      clamp_current(current_target, current_limit_raw),
       delta_ms);
 }
 
@@ -610,6 +897,7 @@ HAL_StatusTypeDef FeederMotor_Init(CAN_HandleTypeDef *hcan)
   feeder.debug.remote_command = FEEDER_REMOTE_DISABLE;
   feeder.debug.state = FEEDER_STATE_DISABLED;
   feeder.debug.fault_reason = FEEDER_FAULT_NONE;
+  feeder.active_command = FEEDER_REMOTE_DISABLE;
   feeder.last_sent_current_raw = INT16_MIN;
   feeder.last_process_ms = HAL_GetTick();
   feeder.last_tx_ms =
@@ -642,9 +930,20 @@ HAL_StatusTypeDef FeederMotor_Init(CAN_HandleTypeDef *hcan)
 void FeederMotor_SetRemoteCommand(FeederRemoteCommand_t command)
 {
   if ((command < FEEDER_REMOTE_DISABLE)
-      || (command > FEEDER_REMOTE_DIRECTION_B))
+      || (command > FEEDER_REMOTE_REVERSE))
   {
     command = FEEDER_REMOTE_DISABLE;
+  }
+
+  if ((command == FEEDER_REMOTE_SINGLE)
+      && (feeder.debug.remote_command
+          != FEEDER_REMOTE_SINGLE))
+  {
+    feeder.single_request_pending = true;
+  }
+  else if (command != FEEDER_REMOTE_SINGLE)
+  {
+    feeder.single_request_pending = false;
   }
   feeder.debug.remote_command = command;
 }
@@ -655,6 +954,7 @@ HAL_StatusTypeDef FeederMotor_EmergencyStop(void)
   feeder.debug.remote_command = FEEDER_REMOTE_DISABLE;
   feeder.debug.armed = false;
   feeder.debug.state = FEEDER_STATE_ESTOP;
+  feeder.single_request_pending = false;
   reset_neutral_timer();
   force_zero_output();
 
@@ -671,6 +971,7 @@ void FeederMotor_ClearEmergencyStop(void)
   feeder.debug.remote_command = FEEDER_REMOTE_DISABLE;
   feeder.debug.armed = false;
   feeder.debug.state = FEEDER_STATE_DISABLED;
+  feeder.single_request_pending = false;
   reset_neutral_timer();
   force_zero_output();
 }

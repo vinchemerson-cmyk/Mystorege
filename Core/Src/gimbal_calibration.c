@@ -1,5 +1,6 @@
 #include "gimbal_calibration.h"
 
+#include "config/gimbal_params.h"
 #include "config/pitch_fusion_config.h"
 #include "motor_control.h"
 #include "pitch_fusion.h"
@@ -202,11 +203,10 @@ static uint16_t calibration_wrap_ecd(int32_t encoder)
 static uint16_t calibration_calculate_zero_ecd(
     GM6020_Axis_t axis)
 {
-  const int32_t average_encoder =
-      calibration_average_axis_unwrapped(axis);
-
   if (axis == GM6020_AXIS_PITCH)
   {
+    const int32_t average_encoder =
+        calibration_average_axis_unwrapped(axis);
     const float average_sensor_angle_deg =
         calibration.pitch_sensor_angle_sum_deg
         / (float)CALIBRATION_SAMPLE_COUNT;
@@ -226,7 +226,11 @@ static uint16_t calibration_calculate_zero_ecd(
         average_encoder - sensor_angle_ecd);
   }
 
-  return calibration_wrap_ecd(average_encoder);
+  /*
+   * Yaw的GM6020编码器是单圈绝对传感器。静止采样只用于确认反馈稳定，
+   * 逻辑零点始终取装机配置的传感器零位，不能被本次开机姿态覆盖。
+   */
+  return (uint16_t)YAW_SENSOR_ZERO_ECD;
 }
 
 static float calibration_abs_float(float value)

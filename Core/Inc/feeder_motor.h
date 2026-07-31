@@ -21,8 +21,9 @@ typedef enum
 {
   FEEDER_REMOTE_DISABLE = 0,
   FEEDER_REMOTE_NEUTRAL,
-  FEEDER_REMOTE_DIRECTION_A,
-  FEEDER_REMOTE_DIRECTION_B
+  FEEDER_REMOTE_CONTINUOUS,
+  FEEDER_REMOTE_SINGLE,
+  FEEDER_REMOTE_REVERSE
 } FeederRemoteCommand_t;
 
 typedef enum
@@ -30,8 +31,9 @@ typedef enum
   FEEDER_STATE_DISABLED = 0,
   FEEDER_STATE_WAIT_NEUTRAL,
   FEEDER_STATE_ARMED_NEUTRAL,
-  FEEDER_STATE_RUNNING_A,
-  FEEDER_STATE_RUNNING_B,
+  FEEDER_STATE_RUNNING_CONTINUOUS,
+  FEEDER_STATE_RUNNING_SINGLE,
+  FEEDER_STATE_RUNNING_REVERSE,
   FEEDER_STATE_ESTOP,
   FEEDER_STATE_FAULT
 } FeederMotorState_t;
@@ -60,10 +62,16 @@ typedef struct
   float pid_d_raw;
   float pid_output_raw;
   int16_t command_current_raw;
+  int64_t total_angle_ecd;
+  int64_t target_total_angle_ecd;
+  int32_t position_error_ecd;
+  uint32_t shot_count;
   FeederRemoteCommand_t remote_command;
   FeederMotorState_t state;
   FeederFaultReason_t fault_reason;
   bool armed;
+  bool single_shot_active;
+  bool single_returning;
   bool emergency_stop_latched;
   bool fault_latched;
 
@@ -77,8 +85,8 @@ typedef struct
 HAL_StatusTypeDef FeederMotor_Init(CAN_HandleTypeDef *hcan);
 
 /*
- * 临时遥控命令入口。上电、急停、掉线或故障后，必须先持续提交NEUTRAL，
- * 模块才会重新解锁；方向切换也必须经过NEUTRAL。
+ * 遥控命令入口。SINGLE只在非SINGLE→SINGLE边沿产生一次单发请求；
+ * 上电、急停、掉线或故障后必须持续提交NEUTRAL才能重新解锁。
  */
 void FeederMotor_SetRemoteCommand(FeederRemoteCommand_t command);
 

@@ -35,8 +35,8 @@
 /* 首次双机方向与闭环验证参数。 */
 #define DUAL_M3508_TARGET_SPEED_RPM            400.0f
 #define DUAL_M3508_TARGET_RAMP_RPM_S           200.0f
-#define DUAL_M3508_SPEED_KP                       5.0f
-#define DUAL_M3508_SPEED_KI                       0.0f
+#define DUAL_M3508_SPEED_KP                       40.0f
+#define DUAL_M3508_SPEED_KI                       2.0f
 #define DUAL_M3508_SPEED_KD                       0.0f
 #define DUAL_M3508_INTEGRAL_LIMIT_RAW          1000.0f
 #define DUAL_M3508_D_FILTER_HZ                   50.0f
@@ -45,7 +45,7 @@
  * C620手册：±16384 raw对应±20 A转矩电流。
  * 首次测试限制±3000 raw，约为±3.66 A转矩电流。
  */
-#define DUAL_M3508_CURRENT_LIMIT_RAW           3000
+#define DUAL_M3508_CURRENT_LIMIT_RAW           6000
 #define DUAL_M3508_CURRENT_SLEW_RAW_PER_MS       50
 
 /* 在线、到速、复位和保护参数。 */
@@ -53,7 +53,7 @@
 #define DUAL_M3508_READY_TOLERANCE_RPM            15
 #define DUAL_M3508_READY_HOLD_MS                 200U
 #define DUAL_M3508_REARM_HOLD_MS                 100U
-#define DUAL_M3508_REARM_MAX_SPEED_RPM            10
+#define DUAL_M3508_REARM_MAX_SPEED_RPM            20
 #define DUAL_M3508_MAX_TEMPERATURE_C              80U
 #define DUAL_M3508_STALL_SPEED_RPM                  5
 #define DUAL_M3508_STALL_CURRENT_RAW              400

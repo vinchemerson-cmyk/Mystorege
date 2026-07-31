@@ -44,6 +44,11 @@ extern "C" {
 #define DBUS_CHANNEL_CENTER      1024U
 #define DBUS_CHANNEL_MAX         1684U
 
+/* 拨轮同样是11 bit通道，位于帧的byte16/17。 */
+#define DBUS_DIAL_MIN            364U
+#define DBUS_DIAL_CENTER         1024U
+#define DBUS_DIAL_MAX            1684U
+
 /* 三挡开关编码：上=1、下=2、中=3 */
 #define DBUS_SWITCH_UP           1U
 #define DBUS_SWITCH_DOWN         2U
@@ -58,6 +63,9 @@ extern "C" {
  * channel[]          原始 11 bit 通道值，正常范围 364~1684，中值约 1024
  * centered_channel[] 去中心值，正常范围约 -660~+660
  * switch_value[]     三挡开关值，0号=S1，1号=S2
+ * dial               拨轮原始11 bit值
+ * centered_dial      拨轮去中心值，正常范围约-660~+660
+ * dial_valid         拨轮是否处于正常范围；拨轮异常不阻断云台和底盘
  * frame_count        主循环取到的完整 18 字节帧总数
  * valid_frame_count  通过通道和开关范围检查的帧数
  * invalid_frame_count 未通过范围检查的帧数
@@ -69,12 +77,15 @@ typedef struct
   uint16_t channel[DBUS_CHANNEL_COUNT];
   int16_t centered_channel[DBUS_CHANNEL_COUNT];
   uint8_t switch_value[2];
+  uint16_t dial;
+  int16_t centered_dial;
   uint32_t frame_count;
   uint32_t valid_frame_count;
   uint32_t invalid_frame_count;
   uint32_t last_valid_frame_ms;
   bool last_frame_valid;
   bool online;
+  bool dial_valid;
 } DBUS_Data_t;
 
 /*

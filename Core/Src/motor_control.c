@@ -1093,8 +1093,9 @@ static void state_position_control_on_feedback(
 /* Outer loop (angle) → target rpm → inner loop (speed) → torque current */
     GM6020_Controller_t *controller)
 {
-  float feedback_position_deg =
+  const float encoder_position_deg =
       controller_encoder_relative_position_deg(controller);
+  float feedback_position_deg = encoder_position_deg;
   float feedback_speed_rpm =
       (float)controller->feedback.speed_rpm;
   float speed_feedforward_rpm;
@@ -1124,6 +1125,23 @@ static void state_position_control_on_feedback(
     }
   }
 
+  /*
+   * 机械软限位必须以电机编码器为准，不能使用可能带有惯性补偿偏差的
+   * 融合角判断端点。当前位置落在限位外（或恰好位于边界）时，临时
+   * 使用编码器角度和电机转速闭环，使限位内的目标必然产生向内恢复
+   * 的速度方向；回到正常范围后自动恢复融合反馈。
+   */
+  if (controller->angle_limit_enabled
+      && ((encoder_position_deg
+           <= controller->minimum_angle_deg)
+          || (encoder_position_deg
+              >= controller->maximum_angle_deg)))
+  {
+    feedback_position_deg = encoder_position_deg;
+    feedback_speed_rpm =
+        (float)controller->feedback.speed_rpm;
+  }
+
   speed_feedforward_rpm =
       position_speed_feedforward_rpm(controller);
 
@@ -1132,6 +1150,24 @@ static void state_position_control_on_feedback(
       controller,
       feedback_position_deg,
       speed_feedforward_rpm);
+
+  /*
+   * 最后一层方向保护：越过下限只允许正转恢复，越过上限只允许反转
+   * 恢复。这样即使目标速度前馈或PID积分残留异常，也不会继续顶向
+   * 机械端点。被拦截时清除角度环积分，避免解除限位后出现反向冲击。
+   */
+  if (controller->angle_limit_enabled
+      && (((encoder_position_deg
+            <= controller->minimum_angle_deg)
+           && (controller->target_speed_rpm < 0.0f))
+          || ((encoder_position_deg
+               >= controller->maximum_angle_deg)
+              && (controller->target_speed_rpm > 0.0f))))
+  {
+    controller->target_speed_rpm = 0.0f;
+    controller->angle_pid.integral = 0.0f;
+    controller->angle_pid.output = 0.0f;
+  }
 
   current_feedforward = model_current_feedforward(
       controller,
@@ -1143,6 +1179,22 @@ static void state_position_control_on_feedback(
       controller->target_speed_rpm,
       feedback_speed_rpm,
       current_feedforward);
+
+  /*
+   * 电流命令也执行同样的单向保护。速度环在制动或保留积分时可能给出
+   * 与目标速度不同号的瞬时电流，因此不能只检查角度环输出。
+   */
+  if (controller->angle_limit_enabled
+      && (((encoder_position_deg
+            <= controller->minimum_angle_deg)
+           && (controller->current_command < 0))
+          || ((encoder_position_deg
+               >= controller->maximum_angle_deg)
+              && (controller->current_command > 0))))
+  {
+    controller->current_command = 0;
+    speed_pid_reset(controller);
+  }
 }
 
 /*

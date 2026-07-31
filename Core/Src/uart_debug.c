@@ -384,6 +384,7 @@ static int format_rc_chassis_line(void)
       "RC_CHASSIS,T=%lu,F=%lu,VF=%lu,IF=%lu,ON=%u,LV=%u,"
       "R0=%u,R1=%u,R2=%u,R3=%u,"
       "C0=%d,C1=%d,C2=%d,C3=%d,S1=%u,S2=%u,"
+      "DIAL=%u,DC=%d,DV=%u,"
       "VX=%ld,VY=%ld,WZ=%ld,OFF=%ld,M=%u,CE=%u,TXE=%lu\r\n",
       (unsigned long)HAL_GetTick(),
       (unsigned long)dbus.frame_count,
@@ -401,6 +402,9 @@ static int format_rc_chassis_line(void)
       (int)dbus.centered_channel[3],
       (unsigned int)dbus.switch_value[0],
       (unsigned int)dbus.switch_value[1],
+      (unsigned int)dbus.dial,
+      (int)dbus.centered_dial,
+      dbus.dial_valid ? 1U : 0U,
       (long)debug_float_to_scaled(chassis.vx, 1000.0f),
       (long)debug_float_to_scaled(chassis.vy, 1000.0f),
       (long)debug_float_to_scaled(chassis.wz, 1000.0f),
@@ -427,6 +431,7 @@ static int format_feeder_line(void)
       sizeof(debug_buffer),
       "FEEDER,T=%lu,INIT=%u,ON=%u,SEQ=%lu,ST=%u,RC=%u,"
       "ARM=%u,EST=%u,FLT=%u,FR=%u,ANG=%u,RPM=%d,TGT=%ld,"
+      "POS=%lld,REF=%lld,PE=%ld,SHOT=%lu,SA=%u,SR=%u,"
       "E=%ld,P=%ld,I=%ld,D=%ld,OUT=%ld,CMD=%d,ACT=%d,"
       "ERR=%u,AGE=%lu,TXE=%lu,UTE=%lu\r\n",
       (unsigned long)now,
@@ -443,6 +448,12 @@ static int format_feeder_line(void)
       (int)feeder_data.speed_rpm,
       (long)debug_float_to_scaled(
           feeder_data.target_speed_rpm, 100.0f),
+      (long long)feeder_data.total_angle_ecd,
+      (long long)feeder_data.target_total_angle_ecd,
+      (long)feeder_data.position_error_ecd,
+      (unsigned long)feeder_data.shot_count,
+      feeder_data.single_shot_active ? 1U : 0U,
+      feeder_data.single_returning ? 1U : 0U,
       (long)debug_float_to_scaled(
           feeder_data.speed_error_rpm, 1.0f),
       (long)debug_float_to_scaled(
