@@ -33,6 +33,7 @@ typedef enum
   FEEDER_STATE_ARMED_NEUTRAL,
   FEEDER_STATE_RUNNING_CONTINUOUS,
   FEEDER_STATE_RUNNING_SINGLE,
+  FEEDER_STATE_HOLDING_SINGLE,
   FEEDER_STATE_RUNNING_REVERSE,
   FEEDER_STATE_ESTOP,
   FEEDER_STATE_FAULT
@@ -42,7 +43,8 @@ typedef enum
 {
   FEEDER_FAULT_NONE = 0,
   FEEDER_FAULT_ESC,
-  FEEDER_FAULT_STALL
+  FEEDER_FAULT_STALL,
+  FEEDER_FAULT_SINGLE_OVERRUN
 } FeederFaultReason_t;
 
 typedef struct
@@ -71,7 +73,8 @@ typedef struct
   FeederFaultReason_t fault_reason;
   bool armed;
   bool single_shot_active;
-  bool single_returning;
+  bool single_phase_valid;
+  bool single_holding;
   bool emergency_stop_latched;
   bool fault_latched;
 

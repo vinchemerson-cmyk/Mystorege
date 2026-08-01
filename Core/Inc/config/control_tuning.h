@@ -39,42 +39,51 @@
 /* 连发使用方向A；退弹使用较低的方向B速度。单位均为电机转子rpm。 */
 #define TUNE_FEEDER_CONTINUOUS_SPEED_RPM             3000.0f
 #define TUNE_FEEDER_REVERSE_SPEED_RPM                300.0f
-#define TUNE_FEEDER_SPEED_RAMP_RPM_S                3000.0f
+#define TUNE_FEEDER_SPEED_RAMP_RPM_S                8000.0f
 
 /*
  * 单发位置外环：
  *   输出轴每发转过360/10=36°，对应电机3.6圈。
- *   先超过整发落点一个小比例，再反转回到整发落点，避免弹丸停在临界
- *   位置；外环根据输出轴角度误差产生电机目标rpm，内环复用速度PID。
+ *   第一次在当前相位基础上增加一发步距和前向冗余；以后从上一发已经
+ *   完成的超出相位严格增加一发步距，不反向返回理论弹位。
  *   OVERSHOOT_PERCENT必须明显小于50%，防止接近下一发落点。
  */
-#define TUNE_FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG     20.0f
-#define TUNE_FEEDER_SINGLE_MAX_SPEED_RPM              600.0f
+#define TUNE_FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG     12.0f//20.0f
+#define TUNE_FEEDER_SINGLE_MAX_SPEED_RPM              1000.0f
 #define TUNE_FEEDER_SINGLE_OVERSHOOT_PERCENT             8
-#define TUNE_FEEDER_SINGLE_POSITION_TOLERANCE_ECD     128
+#define TUNE_FEEDER_SINGLE_POSITION_TOLERANCE_ECD     256
+#define TUNE_FEEDER_SINGLE_MAX_FORWARD_OVERRUN_ECD   1024
 #define TUNE_FEEDER_SINGLE_SETTLE_SPEED_RPM            10
 #define TUNE_FEEDER_SINGLE_SETTLE_TIME_MS              50U
 
+/*
+ * 单发完成后的单向保持：只在弹丸压力把拨盘向后推时提供较小正向恢复力，
+ * 目标位置或目标前方不施加反向电流。保持限流必须显著低于单发运动限流。
+ */
+#define TUNE_FEEDER_SINGLE_HOLD_DEADBAND_ECD           256
+#define TUNE_FEEDER_SINGLE_HOLD_MAX_SPEED_RPM           60.0f
+#define TUNE_FEEDER_SINGLE_HOLD_CURRENT_LIMIT_RAW      800
+
 /*======================= M2006拨弹盘速度PID ======================*/
 
-#define TUNE_FEEDER_SPEED_KP                            40.0f
-#define TUNE_FEEDER_SPEED_KI                            8.0f
+#define TUNE_FEEDER_SPEED_KP                            15.0f
+#define TUNE_FEEDER_SPEED_KI                            5.0f
 #define TUNE_FEEDER_SPEED_KD                            0.0f
 #define TUNE_FEEDER_SPEED_INTEGRAL_LIMIT_RAW         1000.0f
 #define TUNE_FEEDER_SPEED_D_FILTER_HZ                   50.0f
 
 /* 不同动作分别限流；最终仍受C610协议±10000限制。 */
 #define TUNE_FEEDER_CONTINUOUS_CURRENT_LIMIT_RAW      6000
-#define TUNE_FEEDER_SINGLE_CURRENT_LIMIT_RAW          3500
+#define TUNE_FEEDER_SINGLE_CURRENT_LIMIT_RAW          6000//3500
 #define TUNE_FEEDER_REVERSE_CURRENT_LIMIT_RAW         2500
-#define TUNE_FEEDER_CURRENT_SLEW_RAW_PER_MS            200
+#define TUNE_FEEDER_CURRENT_SLEW_RAW_PER_MS            120
 
 /* 反馈、重新解锁和堵转保护。 */
 #define TUNE_FEEDER_FEEDBACK_TIMEOUT_MS                 50U
 #define TUNE_FEEDER_NEUTRAL_REARM_MS                   100U
 #define TUNE_FEEDER_REARM_MAX_SPEED_RPM                  5
 #define TUNE_FEEDER_STALL_SPEED_THRESHOLD_RPM            5
-#define TUNE_FEEDER_STALL_CURRENT_THRESHOLD_RAW        400
+#define TUNE_FEEDER_STALL_CURRENT_THRESHOLD_RAW        3500
 #define TUNE_FEEDER_STALL_TIMEOUT_MS                   500U
 
 /*====================== Pitch遥控与自动水平 ======================*/
@@ -93,12 +102,12 @@
 /*=========================== Pitch PID ===========================*/
 
 #define TUNE_PITCH_SPEED_PID_KP                         170.0f
-#define TUNE_PITCH_SPEED_PID_KI                          25.0f
+#define TUNE_PITCH_SPEED_PID_KI                          0.0f
 #define TUNE_PITCH_SPEED_PID_KD                           0.0f
 #define TUNE_PITCH_SPEED_PID_OUTPUT_LIMIT              8192.0f
 
 #define TUNE_PITCH_ANGLE_PID_KP                          8.0f
-#define TUNE_PITCH_ANGLE_PID_KI                           3.0f
+#define TUNE_PITCH_ANGLE_PID_KI                           0.0f
 #define TUNE_PITCH_ANGLE_PID_KD                           0.0f
 #define TUNE_PITCH_ANGLE_SPEED_LIMIT_RPM                150.0f
 
@@ -130,11 +139,12 @@
 #define TUNE_PITCH_KALMAN_INITIAL_BIAS_VARIANCE_DPS2      0.01f
 
 /*
- * 首次启用仍保留安全带。当前在实机方向验证后小幅放宽目标速度和电流，
- * 机械端点保护仍由编码器软限位独立执行。
+ * 融合闭环仍保留编码器安全带。为允许车体较大俯仰时保持世界系水平，
+ * 控制用融合角相对编码器角的最大偏差放宽到±10°；机械端点保护仍由
+ * 编码器软限位独立执行。
  */
 #define TUNE_PITCH_FUSION_CONTROL_ENABLE                  1U
-#define TUNE_PITCH_FUSION_MAX_ANGLE_DELTA_DEG             5.0f
+#define TUNE_PITCH_FUSION_MAX_ANGLE_DELTA_DEG            45.0f
 #define TUNE_PITCH_FUSION_MAX_RATE_DELTA_DPS            180.0f
 #define TUNE_PITCH_FUSION_MAX_SPEED_RPM                  45.0f
 #define TUNE_PITCH_FUSION_MAX_CURRENT_RAW              4000.0f
@@ -166,6 +176,16 @@
 #if (TUNE_FEEDER_SINGLE_OVERSHOOT_PERCENT <= 0) \
     || (TUNE_FEEDER_SINGLE_OVERSHOOT_PERCENT >= 50)
 #error "Single-shot overshoot must be between 1 and 49 percent"
+#endif
+
+#if TUNE_FEEDER_SINGLE_MAX_FORWARD_OVERRUN_ECD \
+    < TUNE_FEEDER_SINGLE_POSITION_TOLERANCE_ECD
+#error "Single-shot forward overrun window must include position tolerance"
+#endif
+
+#if TUNE_FEEDER_SINGLE_HOLD_DEADBAND_ECD \
+    < TUNE_FEEDER_SINGLE_POSITION_TOLERANCE_ECD
+#error "Single-shot hold deadband must include position tolerance"
 #endif
 
 #endif /* CONTROL_TUNING_H */

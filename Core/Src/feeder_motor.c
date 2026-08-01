@@ -12,8 +12,8 @@
  *   - 上电、急停、遥控掉线和方向切换后必须在中挡保持100 ms重新解锁；
  *   - 重新解锁还要求反馈在线、C610错误码为0且电机接近静止；
  *   - 连发/退弹使用速度环；单发使用位置外环串接同一个速度内环；
- *   - 单发按36:1减速比和每圈10发计算固定步距，先小幅超转再回退
- *     到整发落点；
+ *   - 单发按36:1减速比和每圈10发计算固定步距，保持同一前向超出
+ *     相位，相邻单发目标严格相差一个弹位且不主动反向找中心；
  *   - 反馈超时、C610错误码或软件堵转保护立即输出零电流；
  *   - 停止时不主动反向制动，避免C610回生电压抬升。
  * ===========================================================================
@@ -38,7 +38,7 @@ typedef struct
   float previous_speed_error_rpm;
   float filtered_derivative_rpm_s;
   int64_t single_target_scaled_ecd;
-  int64_t single_final_target_scaled_ecd;
+  int64_t single_completed_target_scaled_ecd;
   FeederRemoteCommand_t active_command;
   uint32_t last_process_ms;
   uint32_t last_tx_ms;
@@ -280,6 +280,13 @@ static HAL_StatusTypeDef send_current(int16_t current_raw)
   return status;
 }
 
+static void invalidate_single_phase(void)
+{
+  feeder.single_completed_target_scaled_ecd = 0;
+  feeder.debug.single_phase_valid = false;
+  feeder.debug.single_holding = false;
+}
+
 static void force_zero_output(void)
 {
   feeder.ramped_target_speed_rpm = 0.0f;
@@ -287,7 +294,7 @@ static void force_zero_output(void)
   feeder.debug.command_current_raw = 0;
   feeder.active_command = FEEDER_REMOTE_DISABLE;
   feeder.debug.single_shot_active = false;
-  feeder.debug.single_returning = false;
+  feeder.debug.single_holding = false;
   feeder.stall_timing = false;
   feeder.single_settle_timing = false;
   reset_speed_pid();
@@ -351,6 +358,7 @@ static void parse_feedback(
     feeder.debug.fault_latched = true;
     feeder.debug.fault_reason = FEEDER_FAULT_ESC;
     feeder.debug.armed = false;
+    invalidate_single_phase();
     force_zero_output();
   }
 }
@@ -502,16 +510,23 @@ static bool start_single_shot(void)
     return false;
   }
 
-  feeder.single_final_target_scaled_ecd =
-      feeder.debug.total_angle_ecd
-        * (int64_t)FEEDER_PROJECTILES_PER_OUTPUT_REV
-      + one_projectile_step_scaled;
-  feeder.single_target_scaled_ecd =
-      feeder.single_final_target_scaled_ecd
-      + overshoot_scaled;
+  if (feeder.debug.single_phase_valid)
+  {
+    feeder.single_target_scaled_ecd =
+        feeder.single_completed_target_scaled_ecd
+        + one_projectile_step_scaled;
+  }
+  else
+  {
+    feeder.single_target_scaled_ecd =
+        feeder.debug.total_angle_ecd
+          * (int64_t)FEEDER_PROJECTILES_PER_OUTPUT_REV
+        + one_projectile_step_scaled
+        + overshoot_scaled;
+  }
   update_single_debug_target();
   feeder.debug.single_shot_active = true;
-  feeder.debug.single_returning = false;
+  feeder.debug.single_holding = false;
   feeder.active_command = FEEDER_REMOTE_SINGLE;
   feeder.debug.state = FEEDER_STATE_RUNNING_SINGLE;
   feeder.single_settle_timing = false;
@@ -520,33 +535,25 @@ static bool start_single_shot(void)
   return true;
 }
 
-static void begin_single_return(void)
+static void finish_single_shot(void)
 {
-  /*
-   * 已确认拨盘越过整发落点后，先撤销正向电流，再把目标切回整发落点。
-   * 下一控制周期会产生小幅反向速度，使弹丸离开临界位置，同时目标
-   * 仍与触发瞬间相差严格一个弹位。
-   */
-  feeder.single_target_scaled_ecd =
-      feeder.single_final_target_scaled_ecd;
-  update_single_debug_target();
-  feeder.debug.single_returning = true;
-  feeder.single_settle_timing = false;
+  feeder.single_completed_target_scaled_ecd =
+      feeder.single_target_scaled_ecd;
+  feeder.debug.single_phase_valid = true;
+  ++feeder.debug.shot_count;
   feeder.ramped_target_speed_rpm = 0.0f;
   feeder.debug.target_speed_rpm = 0.0f;
   feeder.debug.command_current_raw = 0;
+  feeder.debug.single_shot_active = false;
+  feeder.debug.single_holding = true;
+  feeder.single_settle_timing = false;
+  feeder.stall_timing = false;
   reset_speed_pid();
-}
-
-static void finish_single_shot(void)
-{
-  ++feeder.debug.shot_count;
-  force_zero_output();
   feeder.debug.position_error_ecd =
       clamp_int64_to_int32(
           scaled_ecd_to_rounded_ecd(
               single_position_error_scaled()));
-  feeder.debug.state = FEEDER_STATE_ARMED_NEUTRAL;
+  feeder.debug.state = FEEDER_STATE_HOLDING_SINGLE;
 }
 
 static void update_safety_state(uint32_t now)
@@ -558,6 +565,7 @@ static void update_safety_state(uint32_t now)
     feeder.debug.online = false;
     feeder.encoder_initialized = false;
     feeder.single_request_pending = false;
+    invalidate_single_phase();
     disarm_for_neutral();
   }
 
@@ -577,6 +585,7 @@ static void update_safety_state(uint32_t now)
   if (feeder.debug.fault_latched)
   {
     feeder.debug.armed = false;
+    invalidate_single_phase();
     force_zero_output();
     feeder.debug.state = FEEDER_STATE_FAULT;
     if (feeder.debug.remote_command == FEEDER_REMOTE_NEUTRAL)
@@ -597,6 +606,7 @@ static void update_safety_state(uint32_t now)
   if (feeder.debug.remote_command == FEEDER_REMOTE_DISABLE)
   {
     feeder.single_request_pending = false;
+    invalidate_single_phase();
     disarm_for_neutral();
     feeder.debug.state = FEEDER_STATE_DISABLED;
     return;
@@ -605,6 +615,7 @@ static void update_safety_state(uint32_t now)
   if (!feeder.debug.online)
   {
     feeder.single_request_pending = false;
+    invalidate_single_phase();
     disarm_for_neutral();
     feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
     return;
@@ -630,6 +641,44 @@ static void update_safety_state(uint32_t now)
   }
 
   /*
+   * 已完成单发后维持同一前向超出相位。拨轮回中只解除动作方向锁，
+   * 不清除相位；下一次SINGLE边沿从已完成目标严格增加一个弹位。
+   * 从SINGLE直接切换其他动作仍要求先经过NEUTRAL。
+   */
+  if (feeder.debug.state == FEEDER_STATE_HOLDING_SINGLE)
+  {
+    if (feeder.debug.remote_command == FEEDER_REMOTE_NEUTRAL)
+    {
+      feeder.active_command = FEEDER_REMOTE_DISABLE;
+      return;
+    }
+
+    if (feeder.debug.remote_command == FEEDER_REMOTE_SINGLE)
+    {
+      if (feeder.single_request_pending)
+      {
+        feeder.single_request_pending = false;
+        if (!start_single_shot())
+        {
+          invalidate_single_phase();
+          disarm_for_neutral();
+          feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
+        }
+      }
+      return;
+    }
+
+    invalidate_single_phase();
+    if (feeder.active_command != FEEDER_REMOTE_DISABLE)
+    {
+      disarm_for_neutral();
+      feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
+      return;
+    }
+    feeder.debug.state = FEEDER_STATE_ARMED_NEUTRAL;
+  }
+
+  /*
    * 单发一旦启动，即使自复位拨轮马上回中，也必须完成当前固定步距。
    * DISABLE已在前面处理；若中途请求连发或退弹，则立即停止并要求重新
    * 经过NEUTRAL，禁止直接切换方向。
@@ -641,6 +690,7 @@ static void update_safety_state(uint32_t now)
         || (feeder.debug.remote_command
             == FEEDER_REMOTE_REVERSE))
     {
+      invalidate_single_phase();
       disarm_for_neutral();
       feeder.debug.state = FEEDER_STATE_WAIT_NEUTRAL;
     }
@@ -705,6 +755,7 @@ static void update_safety_state(uint32_t now)
   }
 
   feeder.active_command = feeder.debug.remote_command;
+  invalidate_single_phase();
   feeder.debug.state =
       (feeder.active_command == FEEDER_REMOTE_CONTINUOUS)
       ? FEEDER_STATE_RUNNING_CONTINUOUS
@@ -719,12 +770,10 @@ static void update_stall_protection(uint32_t now)
       (feeder.debug.state == FEEDER_STATE_RUNNING_CONTINUOUS)
       || (feeder.debug.state == FEEDER_STATE_RUNNING_SINGLE)
       || (feeder.debug.state == FEEDER_STATE_RUNNING_REVERSE);
-  const bool single_far_from_target =
+  const bool single_requires_forward_motion =
       (feeder.debug.state != FEEDER_STATE_RUNNING_SINGLE)
       || (feeder.debug.position_error_ecd
-          > FEEDER_SINGLE_POSITION_TOLERANCE_ECD)
-      || (feeder.debug.position_error_ecd
-          < -FEEDER_SINGLE_POSITION_TOLERANCE_ECD);
+          > FEEDER_SINGLE_POSITION_TOLERANCE_ECD);
 
   if (speed < 0)
   {
@@ -736,7 +785,7 @@ static void update_stall_protection(uint32_t now)
   }
 
   if (running
-      && single_far_from_target
+      && single_requires_forward_motion
       && (speed <= FEEDER_STALL_SPEED_THRESHOLD_RPM)
       && (current >= FEEDER_STALL_CURRENT_THRESHOLD_RAW))
   {
@@ -752,6 +801,7 @@ static void update_stall_protection(uint32_t now)
       feeder.debug.fault_reason = FEEDER_FAULT_STALL;
       feeder.debug.armed = false;
       feeder.debug.state = FEEDER_STATE_FAULT;
+      invalidate_single_phase();
       force_zero_output();
     }
   }
@@ -768,6 +818,9 @@ static void update_control(uint32_t now)
   float desired_speed_rpm = 0.0f;
   float current_target;
   int16_t current_limit_raw;
+  int16_t next_current_raw;
+  bool single_motion = false;
+  bool single_hold = false;
 
   feeder.last_process_ms = now;
   if (delta_ms == 0U)
@@ -783,6 +836,8 @@ static void update_control(uint32_t now)
        != FEEDER_STATE_RUNNING_CONTINUOUS)
       && (feeder.debug.state
           != FEEDER_STATE_RUNNING_SINGLE)
+      && (feeder.debug.state
+          != FEEDER_STATE_HOLDING_SINGLE)
       && (feeder.debug.state
           != FEEDER_STATE_RUNNING_REVERSE))
   {
@@ -810,27 +865,68 @@ static void update_control(uint32_t now)
         feeder.debug.total_angle_ecd;
     feeder.debug.position_error_ecd = 0;
   }
+  else if (feeder.debug.state
+           == FEEDER_STATE_HOLDING_SINGLE)
+  {
+    const float position_error_output_deg =
+        single_position_error_output_deg();
+
+    current_limit_raw =
+        FEEDER_SINGLE_HOLD_CURRENT_LIMIT_RAW;
+    single_hold = true;
+    if (feeder.debug.position_error_ecd
+        > FEEDER_SINGLE_HOLD_DEADBAND_ECD)
+    {
+      desired_speed_rpm = clamp_float(
+          FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG
+            * position_error_output_deg,
+          0.0f,
+          FEEDER_SINGLE_HOLD_MAX_SPEED_RPM);
+    }
+    else
+    {
+      desired_speed_rpm = 0.0f;
+      feeder.speed_integral_raw = 0.0f;
+      feeder.debug.pid_i_raw = 0.0f;
+    }
+  }
   else
   {
     const float position_error_output_deg =
         single_position_error_output_deg();
     int32_t speed = feeder.debug.speed_rpm;
-    int32_t position_error =
+    const int32_t position_error =
         feeder.debug.position_error_ecd;
 
     current_limit_raw =
         FEEDER_SINGLE_CURRENT_LIMIT_RAW;
+    single_motion = true;
     if (speed < 0)
     {
       speed = -speed;
     }
-    if (position_error < 0)
+
+    /*
+     * 允许速度环在仍正转时使用负电流制动，但位置目标永不要求反转。
+     * 若惯性导致超过允许的前向窗口，则锁存故障而不是反向找中心。
+     */
+    if (position_error
+        < -FEEDER_SINGLE_MAX_FORWARD_OVERRUN_ECD)
     {
-      position_error = -position_error;
+      feeder.debug.fault_latched = true;
+      feeder.debug.fault_reason =
+          FEEDER_FAULT_SINGLE_OVERRUN;
+      feeder.debug.armed = false;
+      feeder.debug.state = FEEDER_STATE_FAULT;
+      invalidate_single_phase();
+      force_zero_output();
+      return;
     }
 
     if ((position_error
          <= FEEDER_SINGLE_POSITION_TOLERANCE_ECD)
+        && (position_error
+            >= -FEEDER_SINGLE_MAX_FORWARD_OVERRUN_ECD)
         && (speed <= FEEDER_SINGLE_SETTLE_SPEED_RPM))
     {
       if (!feeder.single_settle_timing)
@@ -842,14 +938,7 @@ static void update_control(uint32_t now)
                    now - feeder.single_settle_start_ms)
                >= FEEDER_SINGLE_SETTLE_TIME_MS)
       {
-        if (feeder.debug.single_returning)
-        {
-          finish_single_shot();
-        }
-        else
-        {
-          begin_single_return();
-        }
+        finish_single_shot();
         return;
       }
     }
@@ -858,11 +947,21 @@ static void update_control(uint32_t now)
       feeder.single_settle_timing = false;
     }
 
-    desired_speed_rpm = clamp_float(
-        FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG
-          * position_error_output_deg,
-        -FEEDER_SINGLE_MAX_SPEED_RPM,
-        FEEDER_SINGLE_MAX_SPEED_RPM);
+    if (position_error
+        <= FEEDER_SINGLE_POSITION_TOLERANCE_ECD)
+    {
+      desired_speed_rpm = 0.0f;
+      feeder.speed_integral_raw = 0.0f;
+      feeder.debug.pid_i_raw = 0.0f;
+    }
+    else
+    {
+      desired_speed_rpm = clamp_float(
+          FEEDER_SINGLE_POSITION_KP_RPM_PER_DEG
+            * position_error_output_deg,
+          0.0f,
+          FEEDER_SINGLE_MAX_SPEED_RPM);
+    }
   }
 
   feeder.ramped_target_speed_rpm = ramp_speed(
@@ -877,10 +976,33 @@ static void update_control(uint32_t now)
       (float)feeder.debug.speed_rpm,
       delta_ms,
       current_limit_raw);
-  feeder.debug.command_current_raw = slew_current(
+
+  /*
+   * HOLD阶段只允许正向恢复力。单发运动阶段允许负电流给仍在正转的
+   * 电机减速，但电机转速到零或已经反向后立即禁止负向驱动。
+   */
+  if ((single_hold && (current_target < 0.0f))
+      || (single_motion
+          && (feeder.debug.speed_rpm <= 0)
+          && (current_target < 0.0f)))
+  {
+    current_target = 0.0f;
+    feeder.speed_integral_raw = 0.0f;
+    feeder.debug.pid_i_raw = 0.0f;
+  }
+
+  next_current_raw = slew_current(
       feeder.debug.command_current_raw,
       clamp_current(current_target, current_limit_raw),
       delta_ms);
+  if ((single_hold
+       || (single_motion
+           && (feeder.debug.speed_rpm <= 0)))
+      && (next_current_raw < 0))
+  {
+    next_current_raw = 0;
+  }
+  feeder.debug.command_current_raw = next_current_raw;
 }
 
 HAL_StatusTypeDef FeederMotor_Init(CAN_HandleTypeDef *hcan)
@@ -955,6 +1077,7 @@ HAL_StatusTypeDef FeederMotor_EmergencyStop(void)
   feeder.debug.armed = false;
   feeder.debug.state = FEEDER_STATE_ESTOP;
   feeder.single_request_pending = false;
+  invalidate_single_phase();
   reset_neutral_timer();
   force_zero_output();
 
@@ -972,6 +1095,7 @@ void FeederMotor_ClearEmergencyStop(void)
   feeder.debug.armed = false;
   feeder.debug.state = FEEDER_STATE_DISABLED;
   feeder.single_request_pending = false;
+  invalidate_single_phase();
   reset_neutral_timer();
   force_zero_output();
 }

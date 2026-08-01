@@ -431,7 +431,7 @@ static int format_feeder_line(void)
       sizeof(debug_buffer),
       "FEEDER,T=%lu,INIT=%u,ON=%u,SEQ=%lu,ST=%u,RC=%u,"
       "ARM=%u,EST=%u,FLT=%u,FR=%u,ANG=%u,RPM=%d,TGT=%ld,"
-      "POS=%lld,REF=%lld,PE=%ld,SHOT=%lu,SA=%u,SR=%u,"
+      "POS=%lld,REF=%lld,PE=%ld,SHOT=%lu,SA=%u,PV=%u,HOLD=%u,"
       "E=%ld,P=%ld,I=%ld,D=%ld,OUT=%ld,CMD=%d,ACT=%d,"
       "ERR=%u,AGE=%lu,TXE=%lu,UTE=%lu\r\n",
       (unsigned long)now,
@@ -453,7 +453,8 @@ static int format_feeder_line(void)
       (long)feeder_data.position_error_ecd,
       (unsigned long)feeder_data.shot_count,
       feeder_data.single_shot_active ? 1U : 0U,
-      feeder_data.single_returning ? 1U : 0U,
+      feeder_data.single_phase_valid ? 1U : 0U,
+      feeder_data.single_holding ? 1U : 0U,
       (long)debug_float_to_scaled(
           feeder_data.speed_error_rpm, 1.0f),
       (long)debug_float_to_scaled(
