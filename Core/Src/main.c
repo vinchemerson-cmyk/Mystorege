@@ -1,3 +1,44 @@
+/**
+ * ===========================================================================
+ * @file    main.c
+ * @brief   系统入口 — 基于 FreeRTOS 的步兵机器人云台/底盘/发射控制
+ * ===========================================================================
+ *
+ * 【系统概述 (System Overview)】
+ *   本系统是 RoboMaster 步兵机器人电控固件，运行在 STM32F407 上，
+ *   基于 FreeRTOS 多任务架构。控制对象包括：
+ *     - 双轴 GM6020 云台 (Yaw + Pitch)
+ *     - 双 C620/M3508 摩擦轮 (发射机构)
+ *     - C610/M2006 拨弹盘 (单发/连发)
+ *     - CAN 底盘控制命令
+ *     - BMI088 IMU 惯性测量 + Pitch 融合
+ *
+ * 【硬件总线拓扑 (Bus Topology)】
+ *   CAN1 (PD0/PD1) — 云台 Yaw + 拨弹盘 + 底盘命令 (0x300/0x301)
+ *   CAN2 (PB5/PB6) — 云台 Pitch + 双摩擦轮
+ *   USART3 + DMA1  — DBUS 遥控器接收机 (100kbps 8E1)
+ *   USART6 + DMA2  — 调试数据输出 (460800 8N1)
+ *   SPI1           — BMI088 IMU
+ *   USB OTG FS     — CDC 虚拟串口 (上位机协议)
+ *   TIM6           — HAL 时基 (1ms, 替代 SysTick)
+ *
+ * 【架构变化 (RTOS Architecture)】
+ *   早期版本为裸机 while(1) 循环；当前版本改为 FreeRTOS：
+ *     main() 完成外设与业务模块初始化后启动调度器 (osKernelStart)，
+ *     所有业务逻辑在 freertos.c 的 gimbalTask 中以 1 ms 周期运行。
+ *
+ * 【时钟树 (Clock Tree)】
+ *   HSE=8MHz → PLL → SYSCLK=168MHz → HCLK=168MHz
+ *   PCLK1=42MHz (CAN/APB1), PCLK2=84MHz (USART6/APB2)
+ *   USB 48MHz = PLLQ=7
+ *
+ * 【关键配置入口】
+ *   - config/gimbal_params.h        云台 CAN ID、PID、零位、限位
+ *   - config/dual_m3508_params.h    摩擦轮 PID、安全参数
+ *   - config/feeder_params.h        拨弹盘 PID、单发步距
+ *   - config/pitch_fusion_config.h  IMU 融合、Kalman 参数
+ * ===========================================================================
+ */
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -29,15 +70,18 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /*
- * 项目自定义模块：
- *   chassis_can.h  — CAN1 底盘控制命令发送 (Chassis CAN1 command transmission)
- *   control_input.h — USB CDC 双轴串口控制入口 (USB CDC serial control interface)
- *   dual_m3508.h — CAN2双C620/M3508摩擦轮控制
- *   feeder_motor.h — CAN1 C610 ID3 / M2006拨弹盘控制
+ * 项目自定义模块 (Project Custom Modules)：
+ *   chassis_can.h       — CAN1 底盘控制命令发送 (Chassis CAN1 command transmission)
+ *   bmi088.h            — BMI088 6轴 IMU SPI 驱动
+ *   control_input.h     — USB CDC 双轴串口控制入口 (USB CDC serial control interface)
+ *   dbus.h              — DBUS 遥控器接收与解析
+ *   dual_m3508.h        — CAN2 双C620/M3508 摩擦轮控制
+ *   feeder_motor.h      — CAN1 C610 ID3 / M2006 拨弹盘控制
  *   gimbal_calibration.h — 双轴上电自动机械零位采样
- *   motor_control.h — 双轴 GM6020 电机串级 PID 控制 (GM6020 cascaded PID control)
+ *   motor_control.h     — 双轴 GM6020 电机串级 PID 控制
+ *   pitch_fusion.h      — Pitch 轴 IMU/编码器融合
  *   remote_gimbal_control.h — DBUS 摇杆到双轴云台位置目标的映射
- *   uart_debug.h — USART6统一调试数据输出
+ *   uart_debug.h        — USART6 统一调试数据输出
  */
 #include "chassis_can.h"
 #include "bmi088.h"
@@ -59,28 +103,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
-/*
- * 速度环调试上电自启动配置。
- *
- * SPEED_LOOP_DEBUG_BOOT_ENABLE:
- *   0 — 正常模式：上电后进入位置控制（等待串口目标角度）
- *   1 — 调试模式：上电收到 CAN 反馈后自动进入速度环调试，
- *       绕过角度环，以固定 RPM 驱动电机。
- *
- * 仅在需要整定速度环 PID 参数或测试电机机械响应时开启。
- * 正常使用时设为 0。
- *
- * SPEED_LOOP_DEBUG_AXIS:
- *   调试目标轴：GM6020_AXIS_YAW 或 GM6020_AXIS_PITCH
- *
- * SPEED_LOOP_DEBUG_TARGET_RPM:
- *   调试模式下的初始目标转速（rpm），自动限幅到 ±200 RPM。
- *   正负方向由电机安装方向及编码器标定决定。
- */
-#define SPEED_LOOP_DEBUG_BOOT_ENABLE  0U
-#define SPEED_LOOP_DEBUG_AXIS         GM6020_AXIS_YAW
-#define SPEED_LOOP_DEBUG_TARGET_RPM   100.0f
 
 /* USER CODE END PD */
 
@@ -108,8 +130,16 @@ void MX_FREERTOS_Init(void);
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
+  * @brief  The application entry point — 系统主入口。
+  *
+  * 【执行流程】
+  *   阶段1: HAL 底层初始化 (HAL_Init → SystemClock_Config)
+  *   阶段2: 外设初始化 (GPIO/SPI/DMA/CAN/USART/USB)
+  *   阶段3: 业务模块初始化 (GM6020 云台/标定/摩擦轮/拨弹盘/底盘/DBUS/BMI088/融合/调试)
+  *   阶段4: 启动 FreeRTOS 调度器 (osKernelStart)
+  *          调度器接管后不返回，业务逻辑运行在 gimbalTask (freertos.c)
+  *
+  * @retval int 正常情况下不返回。
   */
 int main(void)
 {
@@ -208,44 +238,44 @@ int main(void)
     Error_Handler();
   }
 
-#if SPEED_LOOP_DEBUG_BOOT_ENABLE
-  /*
-   * 【调试配置】上电自动进入速度环调试模式：
-   *   1. 覆盖默认的 PID 增益（便于快速迭代调参无需重新编译）
-   *   2. 进入速度调试模式，以固定 RPM 驱动指定轴
-   *
-   * 调参完成后将 SPEED_LOOP_DEBUG_BOOT_ENABLE 改回 0，重新编译即可。
-   */
-  (void)GM6020_SetSpeedPidGains(
-      SPEED_LOOP_DEBUG_AXIS, 31.0f, 30.0f, 0.0f);
-  GM6020_EnterSpeedDebug(
-      SPEED_LOOP_DEBUG_AXIS, SPEED_LOOP_DEBUG_TARGET_RPM);
-#endif
   /* USER CODE END 2 */
 
-  /* Init scheduler */
+  /* ---- 阶段4：启动 FreeRTOS 调度器 ---- */
+
+  /* 初始化 FreeRTOS 内核 (CMSIS-RTOS v2 封装) */
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+
+  /* 创建 gimbalTask 及其他 RTOS 对象 (线程/互斥/队列等) */
   MX_FREERTOS_Init();
 
-  /* Start scheduler */
+  /* 启动调度器 — 开始任务调度，main() 自此不再返回 */
   osKernelStart();
 
   /* We should never get here as control is now taken by the scheduler */
 
-  /* Infinite loop */
+  /* Infinite loop (防御性代码 — 正常情况下不会执行到这里) */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* osKernelStart() 成功后不会返回；业务调度位于 freertos.c。 */
+    /* osKernelStart() 成功后不会返回；业务调度位于 freertos.c 的 gimbalTask。 */
   }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
+  * @brief  System Clock Configuration — 系统时钟配置
+  * @note   System Clock source    = PLL (HSE 8 MHz)
+  *         SYSCLK  = HSE/PLLM×PLLN/PLLP = 8/6×168/2 = 168 MHz
+  *         HCLK    = SYSCLK/1            = 168 MHz
+  *         PCLK1   = HCLK/4 = 42 MHz   (APB1: CAN1/2, USART3, TIM6, SPI...)
+  *         PCLK2   = HCLK/2 = 84 MHz   (APB2: USART6, ADC...)
+  *         USB 48M = VCO/PLLQ = (8×168/6)/7 = 48 MHz (USB FS)
+  *
+  *         【FreeRTOS 相关】SysTick 由 FreeRTOS 占用用于任务调度心跳，
+  *         HAL 时基改用 TIM6 (见 stm32f4xx_hal_timebase_tim.c)。
   * @retval None
   */
 void SystemClock_Config(void)

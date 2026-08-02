@@ -188,15 +188,23 @@ bool DBUS_ReadRawFrame(uint8_t frame[DBUS_FRAME_LENGTH])
 bool DBUS_Process(void)
 {
   uint8_t frame[DBUS_FRAME_LENGTH];
+      /* 从中断发布区取出的18字节原始帧副本。 */
   uint16_t channel[DBUS_CHANNEL_COUNT];
+      /* 解包后的四个11位原始摇杆值，范围正常约364~1684。 */
   uint16_t dial;
+      /* 解包后的11位拨轮原始值。 */
   uint8_t switch_value[2];
+      /* 两个三挡开关：0号S1，1号S2。 */
   uint32_t index;
+      /* 把四个通道复制到公开数据结构时使用的数组索引。 */
   const uint32_t now = HAL_GetTick();
+      /* 当前时间，用于判断遥控器是否超过100 ms未更新。 */
   const bool frame_available = DBUS_ReadRawFrame(frame);
+      /* 本轮是否真的消费了一个新帧；没有新帧时只做在线超时维护。 */
 
   if (frame_available)
   {
+    /* DBUS 的每个11位字段跨字节排列，先拼成16位再取低11位。 */
     channel[0] =
         ((uint16_t)frame[0]
          | ((uint16_t)frame[1] << 8U))
@@ -275,7 +283,7 @@ const DBUS_Data_t *DBUS_GetData(void)
 void HAL_UARTEx_RxEventCallback(
     UART_HandleTypeDef *huart, uint16_t size)
 {
-  if ((huart == dbus_uart) && (dbus_uart != NULL))
+  if ((dbus_uart != NULL) && (huart == dbus_uart))
   {
     if (size == DBUS_FRAME_LENGTH)
     {

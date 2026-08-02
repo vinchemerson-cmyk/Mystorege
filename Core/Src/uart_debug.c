@@ -45,26 +45,13 @@
 
 #define POSITION_REFERENCE_NONE             0U
 #define POSITION_REFERENCE_CONTROLLER       1U
-#define POSITION_REFERENCE_SPEED_INTEGRAL   2U
 #define POSITION_ACTUAL_ENCODER              1U
 #define POSITION_ACTUAL_FUSION               2U
-#define POSITION_TRACKER_MAX_DELTA_MS      100U
 
 static UART_HandleTypeDef *debug_uart;
 static uint8_t debug_buffer[UART_DEBUG_BUFFER_CAPACITY];
 static uint8_t debug_phase;
 static uint32_t debug_tx_error_count;
-
-typedef struct
-{
-  float position_deg;
-  uint32_t last_update_ms;
-  GM6020_ControlMode_t previous_mode;
-  bool initialized;
-} PositionReferenceTracker_t;
-
-static PositionReferenceTracker_t
-    position_reference_tracker[GM6020_AXIS_COUNT];
 
 static int32_t debug_float_to_scaled(float value, float scale)
 {
@@ -124,17 +111,11 @@ static bool get_actual_position(
 
 static bool get_reference_position(
     GM6020_Axis_t axis,
-    uint32_t now,
     float actual_position_deg,
     bool actual_valid,
     float *reference_position_deg,
     uint8_t *source)
 {
-  PositionReferenceTracker_t *tracker;
-  const GM6020_SpeedDebugData_t control =
-      GM6020_GetSpeedDebugData(axis);
-  uint32_t delta_ms;
-
   if ((reference_position_deg == NULL)
       || (source == NULL)
       || ((uint32_t)axis >= (uint32_t)GM6020_AXIS_COUNT))
@@ -142,60 +123,22 @@ static bool get_reference_position(
     return false;
   }
 
-  tracker = &position_reference_tracker[axis];
   *source = POSITION_REFERENCE_NONE;
   if (!actual_valid)
   {
-    tracker->initialized = false;
     *reference_position_deg = actual_position_deg;
     return false;
   }
 
-  if (control.mode == GM6020_MODE_POSITION)
+  if (GM6020_GetTargetPosition(
+          axis, reference_position_deg))
   {
-    tracker->position_deg = actual_position_deg;
-    tracker->last_update_ms = now;
-    tracker->previous_mode = control.mode;
-    tracker->initialized = true;
-
-    if (GM6020_GetTargetPosition(
-            axis, reference_position_deg))
-    {
-      tracker->position_deg = *reference_position_deg;
-      *source = POSITION_REFERENCE_CONTROLLER;
-      return true;
-    }
-
-    *reference_position_deg = actual_position_deg;
-    return false;
+    *source = POSITION_REFERENCE_CONTROLLER;
+    return true;
   }
 
-  delta_ms = (uint32_t)(now - tracker->last_update_ms);
-  if (!tracker->initialized
-      || (tracker->previous_mode != control.mode)
-      || (delta_ms > POSITION_TRACKER_MAX_DELTA_MS))
-  {
-    tracker->position_deg = actual_position_deg;
-  }
-  else
-  {
-    /*
-     * 纯速度环没有位置目标。这里只为串口绘图积分一条理论轨迹：
-     * rpm * 6 = deg/s。它不参与电机控制，也不会改变任何位置目标。
-     */
-    tracker->position_deg +=
-        control.target_speed_rpm
-        * 6.0f
-        * (float)delta_ms
-        / 1000.0f;
-  }
-
-  tracker->last_update_ms = now;
-  tracker->previous_mode = control.mode;
-  tracker->initialized = true;
-  *reference_position_deg = tracker->position_deg;
-  *source = POSITION_REFERENCE_SPEED_INTEGRAL;
-  return true;
+  *reference_position_deg = actual_position_deg;
+  return false;
 }
 
 static int format_position_line(void)
@@ -211,14 +154,10 @@ static int format_position_line(void)
       &yaw_actual_source);
   const bool yaw_reference_valid = get_reference_position(
       GM6020_AXIS_YAW,
-      now,
       yaw_actual_deg,
       yaw_actual_valid,
       &yaw_reference_deg,
       &yaw_reference_source);
-  const GM6020_ControlMode_t yaw_mode =
-      GM6020_GetControlMode(GM6020_AXIS_YAW);
-
 #if UART_DEBUG_PITCH_POSITION_ENABLE
   float pitch_actual_deg = 0.0f;
   float pitch_reference_deg = 0.0f;
@@ -230,21 +169,17 @@ static int format_position_line(void)
       &pitch_actual_source);
   const bool pitch_reference_valid = get_reference_position(
       GM6020_AXIS_PITCH,
-      now,
       pitch_actual_deg,
       pitch_actual_valid,
       &pitch_reference_deg,
       &pitch_reference_source);
-  const GM6020_ControlMode_t pitch_mode =
-      GM6020_GetControlMode(GM6020_AXIS_PITCH);
-
   return snprintf(
       (char *)debug_buffer,
       sizeof(debug_buffer),
       "POSITION,T=%lu,Y_ACT=%ld,Y_REF=%ld,Y_AOK=%u,Y_ROK=%u,"
-      "Y_ASRC=%u,Y_RSRC=%u,Y_MODE=%u,"
+      "Y_ASRC=%u,Y_RSRC=%u,"
       "P_ACT=%ld,P_REF=%ld,P_AOK=%u,P_ROK=%u,"
-      "P_ASRC=%u,P_RSRC=%u,P_MODE=%u,TXE=%lu\r\n",
+      "P_ASRC=%u,P_RSRC=%u,TXE=%lu\r\n",
       (unsigned long)now,
       (long)debug_float_to_scaled(yaw_actual_deg, 100.0f),
       (long)debug_float_to_scaled(yaw_reference_deg, 100.0f),
@@ -252,21 +187,19 @@ static int format_position_line(void)
       yaw_reference_valid ? 1U : 0U,
       (unsigned int)yaw_actual_source,
       (unsigned int)yaw_reference_source,
-      (unsigned int)yaw_mode,
       (long)debug_float_to_scaled(pitch_actual_deg, 100.0f),
       (long)debug_float_to_scaled(pitch_reference_deg, 100.0f),
       pitch_actual_valid ? 1U : 0U,
       pitch_reference_valid ? 1U : 0U,
       (unsigned int)pitch_actual_source,
       (unsigned int)pitch_reference_source,
-      (unsigned int)pitch_mode,
       (unsigned long)debug_tx_error_count);
 #else
   return snprintf(
       (char *)debug_buffer,
       sizeof(debug_buffer),
       "POSITION,T=%lu,Y_ACT=%ld,Y_REF=%ld,Y_AOK=%u,Y_ROK=%u,"
-      "Y_ASRC=%u,Y_RSRC=%u,Y_MODE=%u,TXE=%lu\r\n",
+      "Y_ASRC=%u,Y_RSRC=%u,TXE=%lu\r\n",
       (unsigned long)now,
       (long)debug_float_to_scaled(yaw_actual_deg, 100.0f),
       (long)debug_float_to_scaled(yaw_reference_deg, 100.0f),
@@ -274,7 +207,6 @@ static int format_position_line(void)
       yaw_reference_valid ? 1U : 0U,
       (unsigned int)yaw_actual_source,
       (unsigned int)yaw_reference_source,
-      (unsigned int)yaw_mode,
       (unsigned long)debug_tx_error_count);
 #endif
 }
@@ -287,10 +219,10 @@ static int format_gimbal_line(void)
       GM6020_GetFeedback(GM6020_AXIS_PITCH);
   GM6020_Feedback_t yaw_feedback = {0};
   GM6020_Feedback_t pitch_feedback = {0};
-  const GM6020_SpeedDebugData_t yaw_control =
-      GM6020_GetSpeedDebugData(GM6020_AXIS_YAW);
-  const GM6020_SpeedDebugData_t pitch_control =
-      GM6020_GetSpeedDebugData(GM6020_AXIS_PITCH);
+  const GM6020_ControlTelemetry_t yaw_control =
+      GM6020_GetControlTelemetry(GM6020_AXIS_YAW);
+  const GM6020_ControlTelemetry_t pitch_control =
+      GM6020_GetControlTelemetry(GM6020_AXIS_PITCH);
   float yaw_position_deg = 0.0f;
   float pitch_position_deg = 0.0f;
 
@@ -313,10 +245,10 @@ static int format_gimbal_line(void)
       "GIMBAL,T=%lu,E=%u,CY=%u,CP=%u,"
       "YON=%u,YE=%u,YP=%ld,YR=%d,YTC=%d,YC=%d,"
       "YT=%ld,YER=%ld,YO=%ld,YVFF=%ld,YIFF=%ld,"
-      "YKP=%ld,YKI=%ld,YKD=%ld,YM=%u,"
+      "YKP=%ld,YKI=%ld,YKD=%ld,"
       "PON=%u,PE=%u,PP=%ld,PR=%d,PTC=%d,PC=%d,"
       "PT=%ld,PER=%ld,PO=%ld,PVFF=%ld,PIFF=%ld,"
-      "PKP=%ld,PKI=%ld,PKD=%ld,PM=%u,TXE=%lu\r\n",
+      "PKP=%ld,PKI=%ld,PKD=%ld,TXE=%lu\r\n",
       (unsigned long)HAL_GetTick(),
       GM6020_IsEmergencyStopped() ? 1U : 0U,
       (unsigned int)GimbalCalibration_GetAxisStatus(
@@ -342,7 +274,6 @@ static int format_gimbal_line(void)
       (long)debug_float_to_scaled(yaw_control.kp, 100.0f),
       (long)debug_float_to_scaled(yaw_control.ki, 100.0f),
       (long)debug_float_to_scaled(yaw_control.kd, 100.0f),
-      (unsigned int)yaw_control.mode,
       pitch_feedback.online ? 1U : 0U,
       (unsigned int)pitch_feedback.angle,
       (long)debug_float_to_scaled(pitch_position_deg, 100.0f),
@@ -362,7 +293,6 @@ static int format_gimbal_line(void)
       (long)debug_float_to_scaled(pitch_control.kp, 100.0f),
       (long)debug_float_to_scaled(pitch_control.ki, 100.0f),
       (long)debug_float_to_scaled(pitch_control.kd, 100.0f),
-      (unsigned int)pitch_control.mode,
       (unsigned long)debug_tx_error_count);
 }
 
@@ -626,8 +556,8 @@ static int format_pitch_fusion_line(void)
   PitchFusionData_t fusion = {0};
   const GM6020_Feedback_t *pitch_feedback =
       GM6020_GetFeedback(GM6020_AXIS_PITCH);
-  const GM6020_SpeedDebugData_t pitch_control =
-      GM6020_GetSpeedDebugData(GM6020_AXIS_PITCH);
+  const GM6020_ControlTelemetry_t pitch_control =
+      GM6020_GetControlTelemetry(GM6020_AXIS_PITCH);
 
   if (fusion_ptr != NULL)
   {
@@ -698,22 +628,13 @@ HAL_StatusTypeDef UART_Debug_Init(UART_HandleTypeDef *uart)
   debug_uart = uart;
   debug_phase = 0U;
   debug_tx_error_count = 0U;
-  for (uint32_t axis = 0U;
-       axis < (uint32_t)GM6020_AXIS_COUNT;
-       ++axis)
-  {
-    position_reference_tracker[axis].position_deg = 0.0f;
-    position_reference_tracker[axis].last_update_ms = 0U;
-    position_reference_tracker[axis].previous_mode =
-        GM6020_MODE_POSITION;
-    position_reference_tracker[axis].initialized = false;
-  }
   return HAL_OK;
 }
 
 void UART_Debug_Process(void)
 {
   int length;
+      /* 当前时隙格式化后要发送的字节数。 */
 
   if (debug_uart == NULL)
   {
@@ -729,6 +650,7 @@ void UART_Debug_Process(void)
     return;
   }
 
+  /* debug_phase是0~13的轮询索引，决定本次输出哪一种文本行。 */
   switch (debug_phase)
   {
     case 0U:
@@ -779,6 +701,7 @@ void UART_Debug_Process(void)
     return;
   }
 
+  /* 发送成功后才进入下一个时隙；发送忙/格式错误会留在当前时隙重试。 */
   debug_phase = (uint8_t)(
       (debug_phase + 1U) % UART_DEBUG_PHASE_COUNT);
 }

@@ -52,9 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dual_m3508.c
     Core/Src/feeder_motor.c
     Core/Src/bmi088.c
-    Core/Src/bmi088_monitor.c
     Core/Src/dbus.c
-    Core/Src/dbus_monitor.c
     Core/Src/gimbal_calibration.c
     Core/Src/pitch_fusion.c
     Core/Src/remote_gimbal_control.c

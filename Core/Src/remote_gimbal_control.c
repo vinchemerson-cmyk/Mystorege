@@ -5,10 +5,7 @@
  * ===========================================================================
  *
  * 控制方式：
- *   GIMBAL_YAW_ONLY_TEST_MODE=1：
- *     CH0 → Yaw目标RPM，绕过角度环，直接调试速度环
- *   GIMBAL_YAW_ONLY_TEST_MODE=0：
- *     CH0 → Yaw 目标角速度 → 积分得到 Yaw 多圈位置目标
+ *   CH0 → Yaw 目标角速度 → 积分得到 Yaw 多圈位置目标
  *   CH1 → Pitch 目标角速度 → 积分得到 Pitch 单圈位置目标
  *   CH2 → 底盘横移速度 vy
  *   CH3 → 底盘前进速度 vx
@@ -95,8 +92,8 @@
  * 底盘速度映射。满杆对应±5.0 m/s，发送模块再转换为Q10原始值±5120。
  * 当前坐标约定：vx向前为正，vy向左为正。
  */
-#define REMOTE_CHASSIS_MAX_FORWARD_MPS       5.0f
-#define REMOTE_CHASSIS_MAX_LATERAL_MPS       5.0f
+#define REMOTE_CHASSIS_MAX_FORWARD_MPS       1.0f
+#define REMOTE_CHASSIS_MAX_LATERAL_MPS      -1.0f
 #define REMOTE_CHASSIS_FORWARD_DIRECTION     1.0f
 #define REMOTE_CHASSIS_LATERAL_DIRECTION    -1.0f
 
@@ -475,13 +472,6 @@ static bool remote_axis_is_available(
 {
   const GM6020_Feedback_t *feedback;
 
-#if GIMBAL_YAW_ONLY_TEST_MODE
-  if (axis == GM6020_AXIS_PITCH)
-  {
-    return false;
-  }
-#endif
-
   if ((dbus_data == NULL)
       || !dbus_data->online
       || !GimbalCalibration_IsAxisCalibrated(axis)
@@ -521,8 +511,7 @@ void RemoteGimbalControl_Init(void)
  *
  * 【控制流程】
  *   1. 分别检查两轴接管条件，不满足的轴单独deactivate
- *   2. Yaw-only模式下：CH0直接映射目标RPM，进入纯速度环调试
- *   3. 双轴模式下：从实时位置建立积分起点，再积分角速度下传位置目标
+ *   2. 从实时位置建立积分起点，再积分角速度下传位置目标
  *
  * 【积分公式】
  *   new_target = old_target + normalized * direction * max_rate * (delta_ms / 1000)
@@ -537,22 +526,29 @@ void RemoteGimbalControl_Init(void)
 void RemoteGimbalControl_Process(void)
 {
   const uint32_t now = HAL_GetTick();
+      /* 当前系统时间，用于对摇杆角速度做时间积分。 */
   const DBUS_Data_t *dbus_data = DBUS_GetData();
+      /* 最近一次已解析的遥控器快照，不直接读取DMA缓冲区。 */
   bool yaw_available;
+      /* Yaw是否满足在线、标定、未急停等接管条件。 */
   bool pitch_available;
+      /* Pitch是否满足自己的接管条件。 */
   bool pitch_fusion_ready;
+      /* Pitch当前是否可以把融合角/速率交给电机闭环。 */
   uint32_t delta_ms;
+      /* 两次处理之间的时间，限制到最大20 ms。 */
   float yaw_input;
+      /* Yaw摇杆去中心并归一化后的-1~+1输入。 */
   float pitch_input;
-#if GIMBAL_YAW_ONLY_TEST_MODE
-  float yaw_target_speed_rpm;
-#else
+      /* Pitch摇杆去中心并归一化后的-1~+1输入。 */
   float yaw_rate_dps;
-#endif
   float pitch_rate_dps;
   float previous_target_deg;
+      /* 目标更新前的角度，用来反推出本拍实际目标速度前馈。 */
   float pitch_feedback_deg;
+      /* Pitch融合/编码器控制反馈角度。 */
   float pitch_feedback_rpm;
+      /* Pitch融合/编码器控制反馈转速；这里只用于接口接收和状态判断。 */
 
   process_temporary_s1_safety(dbus_data);
   process_chassis_control(dbus_data);
@@ -582,17 +578,8 @@ void RemoteGimbalControl_Process(void)
   if (!yaw_available)
   {
     remote_control.axis_active[GM6020_AXIS_YAW] = false;
-#if GIMBAL_YAW_ONLY_TEST_MODE
-    /*
-     * DBUS、标定或Yaw反馈任一条件失效时，先把速度目标清零。
-     * 反馈超时和急停仍由电机控制层进一步强制零电流。
-     */
-    GM6020_SetSpeedDebugTarget(
-        GM6020_AXIS_YAW, 0.0f);
-#else
     GM6020_SetPositionFeedforward(
         GM6020_AXIS_YAW, 0.0f, 0.0f);
-#endif
   }
   if (!pitch_available)
   {
@@ -615,30 +602,6 @@ void RemoteGimbalControl_Process(void)
 
   if (yaw_available)
   {
-#if GIMBAL_YAW_ONLY_TEST_MODE
-    yaw_input = normalize_channel(
-        dbus_data->centered_channel[
-            REMOTE_GIMBAL_YAW_CHANNEL]);
-    yaw_target_speed_rpm =
-        yaw_input
-        * REMOTE_GIMBAL_YAW_DIRECTION
-        * YAW_REMOTE_SPEED_DEBUG_MAX_RPM;
-
-    /*
-     * 首次接管或其他模块退出速度模式后，从0 RPM重新进入速度调试，
-     * 随后把当前CH0映射结果提交给速度环。角度环在该模式下完全绕过。
-     */
-    if (!remote_control.axis_active[GM6020_AXIS_YAW]
-        || (GM6020_GetControlMode(GM6020_AXIS_YAW)
-            != GM6020_MODE_SPEED_DEBUG))
-    {
-      GM6020_EnterSpeedDebug(
-          GM6020_AXIS_YAW, 0.0f);
-      remote_control.axis_active[GM6020_AXIS_YAW] = true;
-    }
-    GM6020_SetSpeedDebugTarget(
-        GM6020_AXIS_YAW, yaw_target_speed_rpm);
-#else
     if (!remote_control.axis_active[GM6020_AXIS_YAW])
     {
       if (GM6020_GetMultiTurnPosition(
@@ -661,7 +624,7 @@ void RemoteGimbalControl_Process(void)
       yaw_rate_dps =
           yaw_input
           * REMOTE_GIMBAL_YAW_DIRECTION
-          * REMOTE_GIMBAL_YAW_MAX_RATE_DPS;
+          * REMOTE_GIMBAL_YAW_MAX_RATE_DPS;//摇杆灵敏度?
       previous_target_deg = remote_control.yaw_target_deg;
       remote_control.yaw_target_deg +=
           yaw_rate_dps
@@ -682,7 +645,6 @@ void RemoteGimbalControl_Process(void)
           yaw_rate_dps / 6.0f,
           0.0f);
     }
-#endif
   }
 
   if (pitch_available)

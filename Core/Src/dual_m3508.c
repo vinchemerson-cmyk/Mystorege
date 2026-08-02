@@ -31,27 +31,45 @@
 typedef struct
 {
   float integral_raw;
+      /* 速度环积分项，单位近似为电流 raw。 */
   float previous_error_rpm;
+      /* 上一拍目标-反馈转速误差。 */
   float filtered_derivative_rpm_s;
+      /* 经过一阶低通后的误差变化率。 */
   float logical_current_raw;
+      /* 统一到“发射正方向”的内部电流命令。 */
   uint32_t stall_start_ms;
+      /* 本台电机开始满足堵转条件的时刻。 */
   bool initialized;
+      /* 是否已经有上一拍 PID 状态。 */
   bool stall_timing;
+      /* 是否正在累计堵转持续时间。 */
 } DualM3508PidState_t;
 
 typedef struct
 {
   CAN_HandleTypeDef *can;
+      /* CAN2 HAL 句柄。 */
   DualM3508DebugData_t debug;
+      /* 对外调试快照，同时保存状态机输入/输出。 */
   DualM3508PidState_t pid[DUAL_M3508_MOTOR_COUNT];
+      /* 两台电机各自独立的 PID 状态。 */
   float ramped_target_speed_rpm;
+      /* 斜坡后的共同逻辑目标转速。 */
   uint32_t last_process_ms;
+      /* 上次进入 Process 的时间，用于 dt。 */
   uint32_t ready_start_ms;
+      /* 两台到速开始持续计时的时刻。 */
   uint32_t rearm_start_ms;
+      /* 故障复位条件开始持续满足的时刻。 */
   bool ready_timing;
+      /* 是否正在计时到速保持窗口。 */
   bool rearm_timing;
+      /* 是否正在计时故障复位保持窗口。 */
   bool enable_seen_off;
+      /* 必须先经历一次关闭，才允许再次从false变true启动。 */
   bool initialized;
+      /* Init 是否已经完成过滤器和 CAN 启动。 */
 } DualM3508Context_t;
 
 static DualM3508Context_t friction;
@@ -390,6 +408,10 @@ static void update_state(uint32_t now)
       (friction.debug.state == DUAL_M3508_STATE_RAMPING)
       || (friction.debug.state == DUAL_M3508_STATE_READY);
 
+  /*
+   * 状态判断顺序就是安全优先级：急停 > 故障 > 未请求 > 等待反馈 > 运行。
+   * 任何更高优先级条件成立都会先 force_zero_output()，不再进入 PID。
+   */
   if (friction.debug.emergency_stop_latched)
   {
     friction.debug.state = DUAL_M3508_STATE_ESTOP;
@@ -597,6 +619,7 @@ static void update_control(uint32_t now)
       (uint32_t)(now - friction.last_process_ms);
   uint32_t motor_index;
 
+  /* 将真实周期限制在安全范围，避免任务被打断后一次产生巨大输出。 */
   friction.last_process_ms = now;
   if (delta_ms == 0U)
   {
@@ -760,6 +783,7 @@ void DualM3508_Process(void)
     return;
   }
 
+  /* 固定顺序：先取完FIFO1反馈，再更新在线/安全状态，最后算PID并发0x200。 */
   receive_feedback(now);
   update_online_state(now);
   update_state(now);

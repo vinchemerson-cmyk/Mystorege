@@ -1,3 +1,21 @@
+/**
+ * ===========================================================================
+ * @file    gimbal_calibration.c
+ * @brief   双轴 GM6020 上电静止采样、零位计算和 Pitch 自动回零
+ * ===========================================================================
+ *
+ * 这是一个“启动阶段安全状态机”，不是 Flash 写入程序：
+ *   - 每次上电重新从反馈和 BMI088 采样；
+ *   - Yaw 使用配置好的绝对编码器零点；
+ *   - Pitch 使用重力角和编码器的相对关系计算水平零点；
+ *   - 标定期间不允许遥控器直接接管；
+ *   - Pitch 标定成功后还要经过慢速回零和稳定判定。
+ *
+ * 因此阅读本文件时，要把 status[] 看成“两条相互独立的流程”，
+ * 不要把 Yaw 离线误认为 Pitch 也必须等待。
+ * ===========================================================================
+ */
+
 #include "gimbal_calibration.h"
 
 #include "config/gimbal_params.h"
@@ -15,21 +33,37 @@
 typedef struct
 {
   GimbalCalibrationStatus_t status[GM6020_AXIS_COUNT];
+      /* 每个轴当前处于哪个标定阶段。 */
   uint32_t last_sequence[GM6020_AXIS_COUNT];
+      /* 上一次已经消费的 GM6020 反馈序号，避免重复采同一帧。 */
   uint16_t sample_count[GM6020_AXIS_COUNT];
+      /* 已收集的有效编码器样本数。 */
   int32_t reference_ecd[GM6020_AXIS_COUNT];
+      /* 本轮采样的编码器参考值，用于跨0点展开。 */
   int32_t minimum_unwrapped_ecd[GM6020_AXIS_COUNT];
+      /* 展开后样本的最小值，用于判断手是否在晃动。 */
   int32_t maximum_unwrapped_ecd[GM6020_AXIS_COUNT];
+      /* 展开后样本的最大值，用于判断样本跨度。 */
   int64_t sum_unwrapped_ecd[GM6020_AXIS_COUNT];
+      /* 展开编码器值累加和，最后除以100得到平均值。 */
   float pitch_sensor_angle_sum_deg;
+      /* Pitch 的 BMI088 重力角累加和。Yaw 不使用此字段。 */
   float pitch_return_target_deg;
+      /* Pitch 慢速回零的当前位置目标，按速率逐步逼近0度。 */
   uint32_t pitch_return_motion_start_ms;
+      /* Pitch 回零阶段开始计时的时刻，也用于总超时保护。 */
   uint32_t pitch_return_last_ms;
+      /* 上次更新回零目标的时间，用于计算本次斜坡步长。 */
   uint32_t pitch_return_settle_start_ms;
+      /* Pitch 首次进入到位低速区间的时刻。 */
   uint32_t last_pitch_imu_sample_count;
+      /* 上次使用的 IMU 序号，确保编码器帧和 IMU 样本都更新。 */
   bool pitch_return_target_valid;
+      /* 急停/掉线恢复后是否已经从当前实际位置重新锚定目标。 */
   bool pitch_return_settling;
+      /* 是否正在累计“到位且低速保持”的时间。 */
   bool reference_valid[GM6020_AXIS_COUNT];
+      /* 本轮采样参考编码器值是否已经建立。 */
 } CalibrationContext_t;
 
 static CalibrationContext_t calibration;
@@ -79,6 +113,14 @@ static bool calibration_sample_axis(
   int32_t unwrapped;
   int32_t delta;
 
+  /*
+   * 一个“有效样本”必须同时满足：
+   *   1. 有新的 GM6020 反馈；
+   *   2. Pitch 还有新的 BMI088 样本；
+   *   3. 陀螺角速度很小、加速度可信；
+   *   4. 编码器展开后的总跨度不超过安全阈值。
+   * 失败返回 false，由上层清空本轴样本并重新等待静止。
+   */
   if ((feedback == NULL)
       || (calibration.sample_count[axis]
           >= CALIBRATION_SAMPLE_COUNT)
@@ -470,6 +512,10 @@ void GimbalCalibration_Process(void)
 {
   uint32_t axis_index;
 
+  /*
+   * 每次只推进一个控制周期。标定完成的轴直接跳过，
+   * 所以 Yaw/Pitch 可以在不同时间独立完成。
+   */
   for (axis_index = 0U;
        axis_index < (uint32_t)GM6020_AXIS_COUNT;
        ++axis_index)

@@ -18,6 +18,58 @@
  *     惯性角拉回编码器角；
  *   - 对电机闭环发布的角度和速度带有独立安全限制，融合失效时调用方
  *     必须立即回退到编码器和电机RPM。
+ *     灵魂流程图
+*
+*     // 1. 读取编码器
+encoder_angle = GetMotorAngle();
+encoder_speed = GetMotorSpeed();
+
+// 2. 读取IMU
+accel_angle = GetAccelPitch();
+gyro_rate = GetGyroPitchRate();
+
+// 3. 开机静止标定
+gyro_bias =
+    average(gyro_rate);
+
+accel_offset =
+    average(accel_angle - encoder_angle);
+
+// 4. 对齐
+gyro_rate -= gyro_bias;
+accel_angle -= accel_offset;
+
+// 5. 陀螺预测
+predicted_angle =
+    fused_angle + gyro_rate * dt;
+
+// 6. 加速度计可信？
+if (accel_is_trusted)
+{
+    innovation =
+        accel_angle - predicted_angle;
+
+    // Kalman更新
+    fused_angle =
+        predicted_angle
+        + K * innovation;
+
+    gyro_bias +=
+        K_bias * innovation;
+}
+else
+{
+    fused_angle =
+        predicted_angle;
+}
+
+// 7. 速度直接使用校正后的陀螺
+fused_speed =
+    gyro_rate;
+
+// 8. 估计底座扰动
+base_disturbance =
+    gyro_rate - encoder_speed;
  * ===========================================================================
  */
 
@@ -39,16 +91,27 @@
 typedef struct
 {
   PitchFusionData_t output;
+      /* 对外发布的融合结果和诊断字段。 */
   float calibration_gyro_sum_dps;
+      /* 静止标定期间陀螺角速度累加和，用于估计零偏。 */
   float calibration_accel_minus_encoder_sum_deg;
+      /* 静止标定期间“重力角-编码器角”的累加和。 */
   float accel_minus_encoder_offset_deg;
+      /* 平均安装偏差，运行时从原始重力角中减去。 */
   uint32_t last_imu_sample_count;
+      /* 最近一次真正参与融合的 IMU 序号。 */
   uint32_t last_imu_timestamp_ms;
+      /* 最近一次融合样本的时间戳，用来计算dt。 */
   float covariance_00;
+      /* Kalman P矩阵的角度方差。 */
   float covariance_01;
+      /* Kalman P矩阵的角度-零偏协方差。 */
   float covariance_10;
+      /* 与 covariance_01 对称的交叉协方差。 */
   float covariance_11;
+      /* Kalman P矩阵的陀螺零偏方差。 */
   bool calibrated;
+      /* 是否已经完成500个静止样本的融合器标定。 */
 } PitchFusionContext_t;
 
 static PitchFusionContext_t pitch_fusion;
@@ -191,17 +254,29 @@ void PitchFusion_Init(void)
 void PitchFusion_Process(void)
 {
   const BMI088_Diagnostic_t *diagnostic;
+      /* BMI088初始化和运行错误状态。 */
   BMI088_Sample_t sample;
+      /* 本拍从序列锁复制出的完整IMU快照。 */
   const uint32_t now = HAL_GetTick();
+      /* 当前系统毫秒计数。 */
   float accel_pitch_raw_deg = 0.0f;
+      /* 还没有减安装偏差的重力角。 */
   float gyro_pitch_rate_dps = 0.0f;
+      /* 按配置轴向和方向换算后的陀螺角速度。 */
   float accel_norm_g = 0.0f;
+      /* 三轴加速度向量模长，用来判断当前是否主要受重力。 */
   float encoder_pitch_deg = 0.0f;
+      /* 编码器测得的相对机械角。 */
   float encoder_rate_dps = 0.0f;
+      /* 电机反馈rpm换算出的机械角速度。 */
   bool imu_valid;
+      /* IMU诊断、样本新鲜度和数值解码是否全部通过。 */
   bool motor_valid;
+      /* Pitch电机反馈和标定坐标是否有效。 */
   bool new_imu_sample;
+      /* 本轮是否拿到了不同于上轮的IMU序号。 */
   bool accel_norm_trusted;
+      /* 当前加速度模长是否在可信范围内。 */
 
   diagnostic = BMI088_GetDiagnostic();
   imu_valid =
@@ -429,6 +504,7 @@ void PitchFusion_Process(void)
       delta_time_s = PITCH_FUSION_MAX_DELTA_TIME_S;
     }
 
+    /* x[0]是角度，x[1]是陀螺零偏；先用去偏后的陀螺积分预测角度。 */
     predicted_pitch_deg =
         pitch_fusion.output.fused_pitch_deg
         + corrected_gyro_rate_dps * delta_time_s;

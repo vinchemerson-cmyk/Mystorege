@@ -105,10 +105,18 @@
   */
 /* Create buffer for reception and transmission           */
 /* It's up to user to redefine and/or remove those define */
-/** Received data over USB are stored in this buffer      */
+/*
+ * USB 接收缓冲区 (USB Receive Buffer): 2048 字节。
+ * USB OUT 端点接收到的数据存储于此，随后由 CDC_Receive_FS()
+ * 提交给 control_in_receive() 进行协议解析。
+ */
 uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 
-/** Data to send over USB CDC are stored in this buffer   */
+/*
+ * USB 发送缓冲区 (USB Transmit Buffer): 2048 字节。
+ * 通常不使用（CDC_Transmit_FS 直接使用调用方缓冲区），
+ * 但 HAL 库要求此缓冲区存在并在此处分配。
+ */
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
@@ -276,12 +284,25 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
   * @param  Len: Number of data received (in bytes)
   * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
   */
+/*
+ * USB CDC 接收回调 (Data received over USB OUT endpoint)。
+ *
+ * 【调用时机】USB 主机向虚拟串口发送数据时，USB 中断上下文调用。
+ *
+ * 【数据流】
+ *   USB OUT 端点 → Buf → control_in_receive(Buf, len) → 串口命令解析
+ *   → 重新设置 RX 缓冲区 → 重新使能接收 (等待下一包数据)
+ *
+ * 【注意】
+ *   control_in_receive() 只做字节缓冲和行组装，不阻塞，
+ *   适合在中断上下文中调用。实际命令执行在主循环 control_in() 中。
+ */
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  control_in_receive(Buf, *Len);
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+  control_in_receive(Buf, *Len);          /* 提交收到的数据 → 命令行解析模块 */
+  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);   /* 重新设置 RX 缓冲区 */
+  USBD_CDC_ReceivePacket(&hUsbDeviceFS);          /* 重新使能接收 — arm next receive */
   return (USBD_OK);
   /* USER CODE END 6 */
 }
@@ -297,16 +318,33 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   * @param  Len: Number of data to be sent (in bytes)
   * @retval USBD_OK if all operations are OK else USBD_FAIL or USBD_BUSY
   */
+/*
+ * USB CDC 数据发送 (Transmit data over USB CDC virtual COM port)。
+ *
+ * 【重要限制】
+ *   Buf 必须在传输完成前保持有效！HAL 使用异步 DMA/中断发送，
+ *   函数返回后缓冲区内容仍可能被硬件读取。调用方必须使用
+ *   静态/持久缓冲区，不能使用栈上临时变量。
+ *
+ * 【返回值】
+ *   USBD_OK   — 发送已提交到 USB 硬件
+ *   USBD_BUSY — 上一次发送尚未完成 (TxState != 0)，调用方应保留
+ *               数据稍后重试
+ *   USBD_FAIL — 发送失败
+ *
+ * 【调用方】
+ *   control_input.c (MiniPC/上位机ACK回复 + FB反馈帧)
+ */
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
   if (hcdc->TxState != 0){
-    return USBD_BUSY;
+    return USBD_BUSY;  /* 上一次发送仍在进行 — previous transmit still in progress */
   }
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
-  result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);   /* 设置发送缓冲区 */
+  result = USBD_CDC_TransmitPacket(&hUsbDeviceFS); /* 提交发送包到 USB IN 端点 */
   /* USER CODE END 7 */
   return result;
 }

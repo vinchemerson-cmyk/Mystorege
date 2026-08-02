@@ -10,26 +10,20 @@
  *     - 多圈编码器累计追踪（跨零点检测）
  *     - 串级 PID 控制（外环角度环 → 内环速度环 → 转矩电流输出）
  *     - 锁存式急停保护
- *     - 速度环调试模式
  *
  * 【数据类型】
  *   GM6020_Axis_t          轴枚举 (Yaw=0, Pitch=1)
- *   GM6020_ControlMode_t   控制模式 (位置控制 / 速度调试)
  *   GM6020_Feedback_t      完整反馈数据（角度/转速/电流/温度/在线状态）
- *   GM6020_SpeedDebugData_t 速度环调试数据（用于上位机绘图）
+ *   GM6020_ControlTelemetry_t 控制遥测数据（用于USART6记录和绘图）
  *
  * 【对外 API 分组】
  *   初始化:    GM6020_Init()
  *   位置控制:  GM6020_SetTargetPosition(), GM6020_SetMultiTurnTargetPosition(),
  *              GM6020_SetGimbalPosition()
- *   速度调试:  GM6020_EnterSpeedDebug(), GM6020_SetSpeedDebugTarget(),
- *              GM6020_ExitSpeedDebug()
- *   PID 调参:  GM6020_SetSpeedPidGains(), GM6020_SetAnglePidGains()
  *   安全:      GM6020_EmergencyStop(), GM6020_ClearEmergencyStop(),
  *              GM6020_IsEmergencyStopped()
  *   查询:      GM6020_GetFeedback(), GM6020_GetMultiTurnPosition(),
- *              GM6020_GetTargetPosition(), GM6020_GetControlMode(),
- *              GM6020_GetSpeedDebugData()
+ *              GM6020_GetTargetPosition(), GM6020_GetControlTelemetry()
  *   主循环:    GM6020_Process()
  *
  * 【依赖】
@@ -71,15 +65,6 @@ typedef enum
 } GM6020_Axis_t;
 
 /*
- * 对外可查询的控制模式。
- */
-typedef enum
-{
-  GM6020_MODE_POSITION = 0, /* 位置控制模式 — Position Control: 角度环 + 速度环串级 */
-  GM6020_MODE_SPEED_DEBUG   /* 速度调试模式 — Speed Debug: 绕过角度环，目标RPM直接进速度环 */
-} GM6020_ControlMode_t;
-
-/*
  * 单个 GM6020 电机的完整反馈数据及多圈编码器状态。
  *
  * 【编码器说明】
@@ -102,10 +87,10 @@ typedef struct
 } GM6020_Feedback_t;
 
 /*
- * 单轴速度环调试数据。
+ * 单轴串级控制遥测数据。
  *
- * 将速度环的关键变量打包为结构体，方便调试器观察或串口发送到上位机。
- * 可配合 GM6020_GetSpeedDebugData() 在运行中实时获取。
+ * 将位置环输出、速度环反馈与电流命令打包，供保留的USART6接口输出。
+ * 这些字段只用于观测，不会改变控制器状态或PID参数。
  */
 typedef struct
 {
@@ -119,8 +104,7 @@ typedef struct
   float kp;                   /* 当前使用的比例增益 — current proportional gain (Kp) */
   float ki;                   /* 当前使用的积分增益 — current integral gain (Ki) */
   float kd;                   /* 当前使用的微分增益 — current derivative gain (Kd) */
-  GM6020_ControlMode_t mode;  /* 当前控制模式 — current control mode */
-} GM6020_SpeedDebugData_t;
+} GM6020_ControlTelemetry_t;
 
 /*
  * 初始化 Yaw/Pitch 两轴控制器。
@@ -221,60 +205,15 @@ void GM6020_SetGimbalPosition(float yaw_angle_deg,
  *
  * target_speed_rpm是位置目标的一阶导数，target_acceleration_rpm_s是
  * 二阶导数。接口只缓存并限幅前馈，不改变位置目标；急停、故障、反馈源
- * 切换和速度调试模式会自动清零。没有可靠加速度轨迹时传0。
+ * 切换会自动清零。没有可靠加速度轨迹时传0。
  */
 void GM6020_SetPositionFeedforward(
     GM6020_Axis_t axis,
     float target_speed_rpm,
     float target_acceleration_rpm_s);
 
-/*
- * ======================== 速度环调试接口 ========================
- *
- * 速度调试模式绕过角度环，直接用指定 RPM 驱动速度环。
- * 典型用法：
- *   1. GM6020_EnterSpeedDebug(GM6020_AXIS_YAW, 100) — 以 100 RPM 开始调试
- *   2. 观察 GM6020_GetSpeedDebugData() 返回值，调整 PID 增益
- *   3. GM6020_SetSpeedDebugTarget(GM6020_AXIS_YAW, -50) — 阶跃响应测试
- *   4. GM6020_ExitSpeedDebug(GM6020_AXIS_YAW) — 回到位置控制
- *
- * 目标转速会自动限幅到 ±GM6020_DEBUG_SPEED_LIMIT_RPM（默认 200 RPM）。
- */
-
-/* 进入速度调试模式。目标转速自动限幅到 ±200 RPM。 */
-void GM6020_EnterSpeedDebug(GM6020_Axis_t axis,
-                            float target_speed_rpm);
-
-/* 在速度调试模式下实时修改目标转速。仅在 speed_debug_requested 时生效。 */
-void GM6020_SetSpeedDebugTarget(GM6020_Axis_t axis,
-                                float target_speed_rpm);
-
-/* 退出速度调试模式，回到位置控制（会锁定当前位置）。 */
-void GM6020_ExitSpeedDebug(GM6020_Axis_t axis);
-
-/*
- * 运行时修改速度环 PID 增益。
- *
- * 每个轴可使用不同的参数（Yaw/Pitch 负载惯量不同）。
- * 修改后会自动重置积分项和上一拍误差，防止旧积分在新参数下跳变。
- *
- * 返回 false 表示参数无效（axis 越界、负增益、非有限值等）。
- */
-bool GM6020_SetSpeedPidGains(GM6020_Axis_t axis,
-                             float kp, float ki, float kd);
-
-/*
- * 运行时修改角度环 PID 增益。
- * 行为与 GM6020_SetSpeedPidGains 相同（参数校验 + 重置积分）。
- */
-bool GM6020_SetAnglePidGains(GM6020_Axis_t axis,
-                             float kp, float ki, float kd);
-
-/* 查询指定轴的当前控制模式（位置控制 / 速度调试）。 */
-GM6020_ControlMode_t GM6020_GetControlMode(GM6020_Axis_t axis);
-
-/* 获取指定轴的实时速度环调试数据（转速、误差、输出、PID 增益）。 */
-GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
+/* 获取指定轴的实时串级控制遥测（转速、误差、输出、PID 增益）。 */
+GM6020_ControlTelemetry_t GM6020_GetControlTelemetry(
     GM6020_Axis_t axis);
 
 /*
@@ -312,7 +251,6 @@ bool GM6020_GetMultiTurnPosition(
  * 获取位置环当前实际使用的理论位置目标。
  *
  * 只有该轴反馈在线、坐标已初始化、未急停且正在位置控制时返回 true。
- * 纯速度环没有位置目标，因此返回 false。
  */
 bool GM6020_GetTargetPosition(
     GM6020_Axis_t axis,

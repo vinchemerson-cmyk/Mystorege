@@ -33,7 +33,6 @@
  * 【安全机制】
  *   - 反馈超过配置的超时时间 → FAULT 状态 → 输出零电流
  *   - PID 积分项 anti-windup（输出饱和时停止积分累积）
- *   - 速度调试模式目标转速硬限幅 ±200 RPM
  *   - 角度软限位框架（当前 Yaw ±180° 仍是待标定的占位范围）
  *   - 启动阶段尚未收到 CAN 反馈前保持零电流
  * ============================================================================
@@ -56,14 +55,11 @@
  * 控制状态机枚举。
  *
  *   状态转移图：
- *     WAIT_FEEDBACK ──(首次反馈，未请求调试)──▶ POSITION_CONTROL
- *            │                                      │
- *            │                                      └──(超时)──▶ FAULT
- *            │
- *            └──(首次反馈，已请求调试)──▶ SPEED_DEBUG ──(超时)──▶ FAULT
+ *     WAIT_FEEDBACK ──(首次反馈)──▶ POSITION_CONTROL ──(超时)──▶ FAULT
+ *                                         ▲                         │
+ *                                         └──────(反馈恢复)──────────┘
  *
  *   POSITION_CONTROL: 正常位置伺服，角度环 PID → 速度环 PID → 电流输出
- *   SPEED_DEBUG:      绕过角度环，直接用目标 RPM 驱动速度环（调参用）
  *   WAIT_FEEDBACK:    上电/复位后等待电机送来第一帧反馈
  *   FAULT:            反馈超时，输出零电流，等待下一帧有效反馈自动恢复
  */
@@ -71,7 +67,6 @@ typedef enum
 {
   GM6020_STATE_WAIT_FEEDBACK = 0,
   GM6020_STATE_POSITION_CONTROL,
-  GM6020_STATE_SPEED_DEBUG,
   GM6020_STATE_FAULT,
   GM6020_STATE_COUNT
 } GM6020_ControlState_t;
@@ -127,14 +122,12 @@ typedef struct
   float maximum_angle_deg;      /* 逻辑软限位上限（度） */
   bool angle_limit_enabled;     /* 软限位是否启用 */
 
-  /* ---- 速度调试 ---- */
+  /* ---- 串级控制与前馈 ---- */
   float target_speed_rpm;             /* 当前目标转速（位置控制时由角度环输出） */
-  float debug_target_speed_rpm;       /* 速度调试模式下的人工目标转速 */
   float command_speed_feedforward_rpm;/* 位置轨迹目标速度前馈 */
   float command_accel_feedforward_rpm_s;/* 位置轨迹目标加速度前馈 */
   float applied_speed_feedforward_rpm;/* 本拍角度环实际叠加量 */
   float applied_current_feedforward;  /* 本拍速度环实际叠加量 */
-  bool speed_debug_requested;         /* 是否正在/请求进入速度调试模式 */
 
   /* ---- 位置命令 ---- */
   float requested_angle_deg;           /* 单圈角度或累计多圈角度目标 */
@@ -1021,14 +1014,6 @@ static HAL_StatusTypeDef gm6020_send_axis_current(GM6020_Axis_t axis)
   current_command = controllers[axis].current_command;
 
   /* Pack int16 current as Big-Endian into the correct slot offset */
-#if GIMBAL_YAW_ONLY_TEST_MODE
-  if (axis == GM6020_AXIS_PITCH)
-  {
-    current_command = 0;
-  }
-  /* Submit frame to the CAN TX mailbox of this axis's bus */
-#endif
-
   raw = (uint16_t)current_command;
   offset = (uint32_t)axis_can_config[axis].current_slot * 2U;
   tx_data[offset] = (uint8_t)(raw >> 8);
@@ -1095,12 +1080,18 @@ static void state_position_control_on_feedback(
 {
   const float encoder_position_deg =
       controller_encoder_relative_position_deg(controller);
+      /* 编码器相对标定零点的机械角；软限位始终以它为准。 */
   float feedback_position_deg = encoder_position_deg;
+      /* 真正送进角度环的角度，Pitch正常时可能来自融合器。 */
   float feedback_speed_rpm =
       (float)controller->feedback.speed_rpm;
+      /* 真正送进速度环的转速，Pitch正常时可能来自陀螺融合。 */
   float speed_feedforward_rpm;
+      /* 由目标轨迹速度和底座扰动得到的目标转速补偿。 */
   float current_feedforward;
+      /* 由重力/摩擦/速度/加速度模型得到的电流补偿。 */
   bool fusion_available = false;
+      /* 本拍是否成功拿到可用于闭环的 Pitch 融合反馈。 */
 
   if (controller_is_pitch(controller))
   {
@@ -1197,33 +1188,12 @@ static void state_position_control_on_feedback(
   }
 }
 
-/*
- * SPEED_DEBUG 状态下的反馈处理：
- *   绕过角度环，直接用人工设定的 debug_target_speed_rpm 驱动速度环。
- *   用于整定速度环 PID 参数或测试电机响应。
- */
-static void state_speed_debug_on_feedback(
-/* SPEED_DEBUG: 绕过角度环，直接以人工设定的RPM驱动速度环 */
-/* Bypass angle loop; drive speed loop directly with debug_target_speed_rpm */
-    GM6020_Controller_t *controller)
-{
-  controller->target_speed_rpm =
-      controller->debug_target_speed_rpm;
-  controller->current_command = (int16_t)speed_pid_update(
-      controller,
-      controller->target_speed_rpm,
-/* 状态→反馈处理函数映射表，索引与 GM6020_ControlState_t 枚举对齐 */
-      (float)controller->feedback.speed_rpm,
-      0.0f);
-}
-
 /* 状态 → 反馈处理函数映射表，索引与 GM6020_ControlState_t 枚举对齐 */
 static const ControlStateFeedbackHandler_t state_handlers[
     GM6020_STATE_COUNT] =
 {
   state_zero_current_on_feedback,       /* WAIT_FEEDBACK */
   state_position_control_on_feedback,   /* POSITION_CONTROL */
-  state_speed_debug_on_feedback,        /* SPEED_DEBUG */
   state_zero_current_on_feedback        /* FAULT */
 };
 
@@ -1240,7 +1210,6 @@ static const ControlStateFeedbackHandler_t state_handlers[
  *   3. 根据新状态重置 PID 和初始化相关变量：
  *      - WAIT_FEEDBACK: 等待电机响应前保持零电流
  *      - POSITION_CONTROL: 有位置目标则解析，否则锁定当前位置
- *      - SPEED_DEBUG: 应用人工设定的目标转速
  *      - FAULT: 标记离线，清除编码器初始化和旧位置目标，等待反馈恢复
  */
   /* Transition to new state: reset current, reset PIDs, init state-specific variables */
@@ -1248,6 +1217,7 @@ static void control_state_transition(
     GM6020_Controller_t *controller,
     GM6020_ControlState_t next_state)
 {
+  /* 状态切换先清输出，再按新状态重新建立目标和PID历史。 */
   controller->state = next_state;
   controller->current_command = 0;
   position_feedforward_reset(controller);
@@ -1301,14 +1271,6 @@ static void control_state_transition(
       }
       break;
 
-    case GM6020_STATE_SPEED_DEBUG:
-      controller->pitch_fusion_feedback_active = false;
-      controller->target_speed_rpm =
-          controller->debug_target_speed_rpm;
-      speed_pid_reset(controller);
-      angle_pid_reset(controller);
-      break;
-
     case GM6020_STATE_FAULT:
     default:
       controller->state = GM6020_STATE_FAULT;
@@ -1327,9 +1289,8 @@ static void control_state_transition(
  * 收到有效反馈帧后的统一入口。
  *
  * 【行为】
- *   - WAIT_FEEDBACK / FAULT: 自动转移到下一个状态
- *     （speed_debug_requested ? SPEED_DEBUG : POSITION_CONTROL）
- *   - POSITION_CONTROL / SPEED_DEBUG: 保持当前状态不变
+ *   - WAIT_FEEDBACK / FAULT: 自动转移到位置控制
+ *   - POSITION_CONTROL: 保持当前状态不变
  *   - 然后调用当前状态对应的反馈处理函数
  */
 static void control_state_handle_feedback(
@@ -1339,20 +1300,11 @@ static void control_state_handle_feedback(
   {
     case GM6020_STATE_WAIT_FEEDBACK:
     case GM6020_STATE_FAULT:
-      /*
-       * 从 WAIT_FEEDBACK 或 FAULT 恢复：
-       *   如果是上电就请求了速度调试 → 进入 SPEED_DEBUG
-       *   否则 → 进入 POSITION_CONTROL
-       */
       control_state_transition(
-          controller,
-          controller->speed_debug_requested
-          ? GM6020_STATE_SPEED_DEBUG
-          : GM6020_STATE_POSITION_CONTROL);
+          controller, GM6020_STATE_POSITION_CONTROL);
       break;
 
     case GM6020_STATE_POSITION_CONTROL:
-    case GM6020_STATE_SPEED_DEBUG:
       /* 正常状态，无需转移 */
       break;
 
@@ -1369,7 +1321,7 @@ static void control_state_handle_feedback(
 /*
  * 超时检测。
  *
- * 在 POSITION_CONTROL 或 SPEED_DEBUG 状态下，
+ * 在 POSITION_CONTROL 状态下，
  * 如果距上一次收到反馈帧的时间超过 GM6020_FEEDBACK_TIMEOUT_MS，
  * 则认为电机离线，转入 FAULT 状态。
  *
@@ -1382,7 +1334,6 @@ static bool control_state_poll_timeout(
   switch (controller->state)
   {
     case GM6020_STATE_POSITION_CONTROL:
-    case GM6020_STATE_SPEED_DEBUG:
       if ((uint32_t)(now - controller->feedback.last_rx_ms)
           > GM6020_FEEDBACK_TIMEOUT_MS)
       {
@@ -1576,7 +1527,7 @@ HAL_StatusTypeDef GM6020_Init(CAN_HandleTypeDef *yaw_can,
   /*
    * 两轴收到有效反馈前保持零电流。
    * GM6020 在收到第一个非零 0x1FE 帧之前不会发送反馈，
-   * 但发送电流为零的帧是安全的（告知电机初始状态）。
+   * 但发送电流为零的帧是安全的（告知电机初始状态）。encoder_update
    */
   return gm6020_send_all_currents();
 }
@@ -1594,8 +1545,6 @@ HAL_StatusTypeDef GM6020_EmergencyStop(void)
 
     controller->current_command = 0;
     controller->target_speed_rpm = 0.0f;
-    controller->debug_target_speed_rpm = 0.0f;
-    controller->speed_debug_requested = false;
     controller->position_target_valid = false;
     controller->requested_angle_is_multi_turn = false;
     position_feedforward_reset(controller);
@@ -1624,8 +1573,6 @@ void GM6020_ClearEmergencyStop(void)
 
     controller->position_target_valid = false;
     controller->requested_angle_is_multi_turn = false;
-    controller->speed_debug_requested = false;
-    controller->debug_target_speed_rpm = 0.0f;
 
     if (controller->encoder_initialized && controller->feedback.online)
     {
@@ -1951,210 +1898,20 @@ void GM6020_SetPositionFeedforward(
 }
 
 /*
- * 进入速度环调试模式。
+ * 获取指定轴的串级控制遥测数据。
  *
- * 绕过角度环，直接用指定的目标转速驱动速度环。
- * 常用于整定速度环 PID 参数或测试电机机械响应。
- *
- * 【参数】
- *   axis:             目标轴
- *   target_speed_rpm: 目标转速（rpm），自动限幅到 ±GM6020_DEBUG_SPEED_LIMIT_RPM
- *
- * 【注意】
- *   如果当前在 POSITION_CONTROL 状态，会立即转移到 SPEED_DEBUG。
- *   否则只是设置 speed_debug_requested 标志，等状态机自己转移。
- */
-void GM6020_EnterSpeedDebug(GM6020_Axis_t axis,
-                            float target_speed_rpm)
-{
-  GM6020_Controller_t *controller;
-
-  if (emergency_stop_latched
-      || !axis_is_valid(axis)
-      || !isfinite(target_speed_rpm))
-  {
-    return;
-  }
-
-  controller = &controllers[axis];
-  controller->debug_target_speed_rpm = clamp_float(
-      target_speed_rpm,
-      -GM6020_DEBUG_SPEED_LIMIT_RPM,
-      GM6020_DEBUG_SPEED_LIMIT_RPM);
-  controller->target_speed_rpm =
-      controller->debug_target_speed_rpm;
-  controller->speed_debug_requested = true;
-
-  if (controller->state == GM6020_STATE_POSITION_CONTROL)
-  {
-    control_state_transition(
-        controller, GM6020_STATE_SPEED_DEBUG);
-  }
-}
-
-/*
- * 在速度调试模式下实时修改目标转速。
- *
- * 【参数】
- *   axis:             目标轴
- *   target_speed_rpm: 新目标转速（rpm），自动限幅
- *
- * 【注意】
- *   仅在 speed_debug_requested 为 true 时才会更新当前目标转速。
- *   如果已退出速度调试模式，此调用不会产生效果。
- */
-void GM6020_SetSpeedDebugTarget(GM6020_Axis_t axis,
-                                float target_speed_rpm)
-{
-  GM6020_Controller_t *controller;
-
-  if (emergency_stop_latched
-      || !axis_is_valid(axis)
-      || !isfinite(target_speed_rpm))
-  {
-    return;
-  }
-
-  controller = &controllers[axis];
-  controller->debug_target_speed_rpm = clamp_float(
-      target_speed_rpm,
-      -GM6020_DEBUG_SPEED_LIMIT_RPM,
-      GM6020_DEBUG_SPEED_LIMIT_RPM);
-  if (controller->speed_debug_requested)
-  {
-    controller->target_speed_rpm =
-        controller->debug_target_speed_rpm;
-  }
-}
-
-/*
- * 退出速度环调试模式，回到位置控制模式。
- *
- * 清零调试标志和调试目标，转移到 POSITION_CONTROL。
- * 进入位置控制后会锁定当前位置（因为没有有效的 position_target）。
+ * 返回数据结构包含目标/反馈转速、误差、输出电流和当前PID增益，
+ * 仅供USART6记录和上位机绘图，不改变任何控制状态。
  *
  * 【参数】
  *   axis: 目标轴
- */
-void GM6020_ExitSpeedDebug(GM6020_Axis_t axis)
-{
-  GM6020_Controller_t *controller;
-
-  if (!axis_is_valid(axis))
-  {
-    return;
-  }
-
-  controller = &controllers[axis];
-
-  /* 如果根本不在调试模式或没有请求调试，忽略 */
-  if (!controller->speed_debug_requested
-      && (controller->state != GM6020_STATE_SPEED_DEBUG))
-  {
-    return;
-  }
-
-  controller->speed_debug_requested = false;
-  controller->debug_target_speed_rpm = 0.0f;
-  controller->target_speed_rpm = 0.0f;
-  controller->position_target_valid = false;
-  controller->requested_angle_is_multi_turn = false;
-
-  if (controller->state == GM6020_STATE_SPEED_DEBUG)
-  {
-    control_state_transition(
-        controller, GM6020_STATE_POSITION_CONTROL);
-  }
-}
-
-/*
- * 运行时修改速度环 PID 增益。
- *
- * 【参数】
- *   kp, ki, kd: 新的 PID 增益值，必须为非负有限浮点数
- * 【返回值】true 表示设置成功。
- * 【副作用】修改增益后会重置速度环 PID（清零积分和误差），
- *           防止旧积分值在新参数下产生意外的输出跳变。
- */
-bool GM6020_SetSpeedPidGains(GM6020_Axis_t axis,
-                             float kp, float ki, float kd)
-{
-  GM6020_Controller_t *controller;
-
-  if (!axis_is_valid(axis)
-      || !isfinite(kp) || !isfinite(ki) || !isfinite(kd)
-      || (kp < 0.0f) || (ki < 0.0f) || (kd < 0.0f))
-  {
-    return false;
-  }
-
-  controller = &controllers[axis];
-  controller->speed_pid.kp = kp;
-  controller->speed_pid.ki = ki;
-  controller->speed_pid.kd = kd;
-  speed_pid_reset(controller);
-  return true;
-}
-
-/*
- * 运行时修改角度环 PID 增益。
- * 参数和行为同 GM6020_SetSpeedPidGains。
- */
-bool GM6020_SetAnglePidGains(GM6020_Axis_t axis,
-                             float kp, float ki, float kd)
-{
-  GM6020_Controller_t *controller;
-
-  if (!axis_is_valid(axis)
-      || !isfinite(kp) || !isfinite(ki) || !isfinite(kd)
-      || (kp < 0.0f) || (ki < 0.0f) || (kd < 0.0f))
-  {
-    return false;
-  }
-
-  controller = &controllers[axis];
-  controller->angle_pid.kp = kp;
-  controller->angle_pid.ki = ki;
-  controller->angle_pid.kd = kd;
-  angle_pid_reset(controller);
-  return true;
-}
-
-/*
- * 查询指定轴的当前控制模式。
- *
- * 【返回值】
- *   GM6020_MODE_POSITION    位置控制模式
- *   GM6020_MODE_SPEED_DEBUG 速度调试模式
- *   如果 axis 无效，默认返回 GM6020_MODE_POSITION。
- */
-GM6020_ControlMode_t GM6020_GetControlMode(GM6020_Axis_t axis)
-{
-  if (!axis_is_valid(axis))
-  {
-    return GM6020_MODE_POSITION;
-  }
-
-  return controllers[axis].speed_debug_requested
-       ? GM6020_MODE_SPEED_DEBUG
-       : GM6020_MODE_POSITION;
-}
-
-/*
- * 获取指定轴的速度环调试数据。
- *
- * 返回数据结构包含目标/反馈转速、误差、输出电流、当前 PID 增益和控制模式，
- * 可用调试器观察或通过串口发送到上位机绘图。
- *
- * 【参数】
- *   axis: 目标轴
- * 【返回值】填充好的 GM6020_SpeedDebugData_t。
+ * 【返回值】填充好的 GM6020_ControlTelemetry_t。
  *          如果 axis 无效，返回全零结构体。
  */
-GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
+GM6020_ControlTelemetry_t GM6020_GetControlTelemetry(
     GM6020_Axis_t axis)
 {
-  GM6020_SpeedDebugData_t data = {0};
+  GM6020_ControlTelemetry_t data = {0};
   const GM6020_Controller_t *controller;
 
   if (!axis_is_valid(axis))
@@ -2177,7 +1934,6 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
   data.kp = controller->speed_pid.kp;
   data.ki = controller->speed_pid.ki;
   data.kd = controller->speed_pid.kd;
-  data.mode = GM6020_GetControlMode(axis);
   return data;
 }
 
@@ -2208,10 +1964,15 @@ GM6020_SpeedDebugData_t GM6020_GetSpeedDebugData(
 void GM6020_Process(void)
 {
   CAN_RxHeaderTypeDef rx_header;
+      /* 临时保存从某条 CAN 总线 FIFO0 取出的帧头。 */
   uint8_t rx_data[8];
+      /* GM6020 反馈帧的数据区，DLC必须为8。 */
   uint32_t now = HAL_GetTick();
+      /* 本轮控制使用的时间基准；阶段1结束后会重新读取。 */
   uint32_t axis_index;
+      /* 数组索引：0=Yaw，1=Pitch。 */
   bool command_changed[GM6020_AXIS_COUNT] = {false, false};
+      /* 哪个轴本轮产生了新电流，只有它才需要发送0x1FE。 */
 
   if (!motor_can_is_initialized())
   {

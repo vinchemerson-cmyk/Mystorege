@@ -43,17 +43,18 @@ extern "C" {
 
 /* USER CODE END Includes */
 
-extern UART_HandleTypeDef huart3;
-
-extern UART_HandleTypeDef huart6;
-extern DMA_HandleTypeDef hdma_usart6_tx;
+/* ─── 全局句柄 (Global Handles, 在 usart.c 中定义) ─── */
+extern UART_HandleTypeDef huart3;          /* USART3 — DBUS 遥控器接收 (RX only) */
+extern UART_HandleTypeDef huart6;          /* USART6 — 调试串口 (TX/RX) */
+extern DMA_HandleTypeDef hdma_usart3_rx;   /* USART3 RX DMA — DMA1_Stream1_CH4 */
+extern DMA_HandleTypeDef hdma_usart6_tx;   /* USART6 TX DMA — DMA2_Stream6_CH5 */
 
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
-void MX_USART3_UART_Init(void);
-void MX_USART6_UART_Init(void);
+void MX_USART3_UART_Init(void);  /* DBUS 遥控器串口初始化 — 100kbps 8E1 RX-only */
+void MX_USART6_UART_Init(void);  /* 调试串口初始化 — 460800 8N1 TX/RX */
 
 /* USER CODE BEGIN Prototypes */
 

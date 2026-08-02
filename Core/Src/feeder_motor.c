@@ -32,28 +32,50 @@ typedef struct
 {
   CAN_HandleTypeDef *can;
   FeederMotorDebugData_t debug;
+      /* 对外调试快照，也是拨弹盘状态机的主要公开状态。 */
 
   float ramped_target_speed_rpm;
+      /* 目标速度斜坡后的值，避免电流瞬间跳变。 */
   float speed_integral_raw;
+      /* 速度环积分项。 */
   float previous_speed_error_rpm;
+      /* 上一拍速度误差，用于D项。 */
   float filtered_derivative_rpm_s;
+      /* 低通后的速度误差变化率。 */
   int64_t single_target_scaled_ecd;
+      /* 单发目标，放大保存以保留每发步距的小数部分。 */
   int64_t single_completed_target_scaled_ecd;
+      /* 最近一次已经完成的单发目标，下一发从这里加一个弹位。 */
   FeederRemoteCommand_t active_command;
+      /* 当前真正执行中的命令，用于检测方向切换。 */
   uint32_t last_process_ms;
+      /* 上次控制周期时间。 */
   uint32_t last_tx_ms;
+      /* 上次成功发送0x200的时间。 */
   uint32_t neutral_start_ms;
+      /* 中挡重新解锁计时起点。 */
   uint32_t stall_start_ms;
+      /* 堵转条件开始持续满足的时刻。 */
   uint32_t single_settle_start_ms;
+      /* 单发进入到位低速区间的时刻。 */
   int16_t last_sent_current_raw;
+      /* 最近实际提交给 HAL CAN 的命令，用于避免重复发送。 */
   uint16_t previous_encoder;
+      /* 上一帧单圈编码器值。 */
   bool neutral_timing;
+      /* 是否正在累计中挡解锁时间。 */
   bool stall_timing;
+      /* 是否正在累计堵转时间。 */
   bool single_request_pending;
+      /* SINGLE 上升沿请求，消费一次后清零。 */
   bool single_settle_timing;
+      /* 是否正在累计单发完成保持时间。 */
   bool encoder_initialized;
+      /* 是否已经建立多圈编码器初值。 */
   bool speed_pid_initialized;
+      /* 是否已有上一拍速度误差，可安全计算D项。 */
   bool initialized;
+      /* Init 是否成功。 */
 } FeederMotorContext_t;
 
 static FeederMotorContext_t feeder;
@@ -505,6 +527,11 @@ static bool start_single_shot(void)
        + 50)
       / 100;
 
+  /*
+   * scaled 量把一个弹位乘以“每圈发数”，等价于保留1位小数：
+   *   普通编码器目标 = scaled_target / 10
+   * 这样 29491.2 counts/shot 的 .2 不会在连续单发中丢失。
+   */
   if (!feeder.encoder_initialized)
   {
     return false;
@@ -558,6 +585,10 @@ static void finish_single_shot(void)
 
 static void update_safety_state(uint32_t now)
 {
+  /*
+   * 该函数只决定“能不能运行以及处于哪个状态”，不直接计算PID。
+   * update_control() 会再次检查状态，只有运行状态才可能产生非零电流。
+   */
   if (feeder.debug.online
       && ((uint32_t)(now - feeder.debug.last_rx_ms)
           > FEEDER_FEEDBACK_TIMEOUT_MS))
@@ -822,6 +853,7 @@ static void update_control(uint32_t now)
   bool single_motion = false;
   bool single_hold = false;
 
+  /* dt 来自实际调度间隔；上限防止暂停后突然跳出很大的斜坡步长。 */
   feeder.last_process_ms = now;
   if (delta_ms == 0U)
   {
@@ -1117,6 +1149,7 @@ void FeederMotor_Process(void)
     return;
   }
 
+  /* 先更新反馈，再运行安全状态机，最后才允许PID和CAN输出。 */
   receive_feedback(now);
   update_safety_state(now);
   update_control(now);

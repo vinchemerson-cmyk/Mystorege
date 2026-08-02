@@ -10,9 +10,9 @@ Yaw GM6020 使用 CAN1，Pitch GM6020 使用 CAN2；两台电机都设为 ID 2�
 - 单圈编码器多圈累计
 - 目标角度劣弧（最短路径）处理
 - 位置环、速度环串级PID，以及轨迹/模型前馈框架
-- 等待反馈、位置控制、速度调试、故障四状态控制
+- 等待反馈、位置控制、故障三状态控制
 - 反馈超时后零电流保护
-- USB CDC 双轴位置指令输入
+- Micro-USB CDC双向接口，保留给MiniPC视觉瞄准、开火命令与状态回传
 - DBUS 遥控器 DMA 接收、摇杆解析与 USART6 监视输出
 - DBUS右摇杆分别控制Yaw、Pitch云台位置目标
 - DBUS左摇杆控制底盘前进/横移速度，CAN1周期发送控制命令
@@ -28,7 +28,7 @@ Yaw GM6020 使用 CAN1，Pitch GM6020 使用 CAN2；两台电机都设为 ID 2�
 | MCU | STM32F407 |
 | CAN1 | PD0 = RX，PD1 = TX，1 Mbps；连接Yaw ID 2、C610 ID 3和底盘通信线路 |
 | USART6调试 | PG9 = RX，PG14 = TX，460800-8-N-1；TX使用DMA2 Stream6/Channel 5；对应外壳丝印`UART1`的3-pin口 |
-| USB CDC | `yaw,pitch\r\n`，角度单位为度 |
+| Micro-USB CDC | MiniPC/上位机双向接口；当前支持角度、安全命令和1 Hz状态反馈 |
 | DBUS | PC11 = USART3_RX，100000-8-E-1，DMA 接收 |
 | CAN2 | PB5 = RX，PB6 = TX，1 Mbps；连接Pitch GM6020 ID 2及C620 ID 1/2 |
 | BMI088 SPI1 | PB3 = SCK，PB4 = MISO，PA7 = MOSI，5.25 Mbps，Mode 0 |
@@ -63,9 +63,16 @@ GM6020_Process()
     ├─ 位置环输出目标转速
     ├─ 速度环输出目标电流
     └─ 在对应轴的CAN总线上发送0x1FE电流帧
+    ↓
+control_out() → Micro-USB CDC状态反馈
 ```
 
-## 双轴串口协议
+## MiniPC / USB CDC协议接口
+
+`control_in()`和`control_out()`是后续视觉组联调的固定扩展入口。当前先
+保留已经验证的ASCII角度、安全命令和基础状态帧；瞄准/开火报文格式、
+控制权优先级及开火联锁需要与视觉组共同确定后再扩展，当前程序没有提前
+假定这些字段。
 
 开发板上电后，Yaw或Pitch收到自己的首帧CAN反馈便独立锁定当前位置，
 不会在装机标定前自动转向编码器原始零点。
@@ -76,6 +83,15 @@ GM6020_Process()
 范围为 `-31.0~18.5` 度。命令会分别应用到已经在线并完成标定的轴；至少
 一轴成功接收时回复`OK\r\n`，两轴都不可用时回复`LOCKED\r\n`，格式
 错误时回复`ERR\r\n`。
+
+`control_out()`每1秒向同一个Micro-USB CDC端口发送：
+
+```text
+FB,<yaw_deg>,<pitch_deg>,<yaw_rpm>,<pitch_rpm>,<yaw_online>,<pitch_online>,<estop>\r\n
+```
+
+这个基础帧用于先验证双向链路；正式视觉闭环时可以在该输出入口增加更高
+频率的时间戳、融合姿态、弹速/拨弹状态等字段。
 
 急停指令为 `ESTOP\r\n`，开发板回复 `ESTOPPED\r\n`。该指令锁存后会
 立即将两路 GM6020 电流置零，并通过 CAN1 发送零速度和底盘软件断电
@@ -197,21 +213,19 @@ Yaw位置对比通过`POSITION`行约50 Hz输出：
 ```text
 POSITION,T=时间,Y_ACT=Yaw实际位置,Y_REF=Yaw理论位置,
 Y_AOK=实际位置有效,Y_ROK=理论位置有效,Y_ASRC=实际位置来源,
-Y_RSRC=理论位置来源,Y_MODE=控制模式,TXE=串口错误\r\n
+Y_RSRC=理论位置来源,TXE=串口错误\r\n
 ```
 
 位置均放大100倍，例如`Y_ACT=1234`表示`12.34°`。`Y_RSRC=1`表示
-位置环内部目标，`Y_RSRC=2`表示纯速度环下由目标RPM积分得到的仅供绘图
-理论轨迹；后者不参与电机控制。`Y_MODE=0`表示位置环，`1`表示纯速度环。
+位置环内部目标。
 默认只发送Yaw；把`Core/Inc/uart_debug.h`中的
 `UART_DEBUG_PITCH_POSITION_ENABLE`改为`1U`后，同一行会追加
-`P_ACT/P_REF/P_AOK/P_ROK/P_ASRC/P_RSRC/P_MODE`。Pitch实际位置来源
+`P_ACT/P_REF/P_AOK/P_ROK/P_ASRC/P_RSRC`。Pitch实际位置来源
 `P_ASRC=1`表示编码器，`2`表示融合反馈。
 
 云台与速度环数据通过`GIMBAL`行约14.3 Hz输出。`YP/PP`为放大100倍的
 角度，`YT/PT`和`YER/PER`为放大100倍的目标RPM与速度误差；
-`YC/PC`为实际CAN电流命令，`YTC/PTC`为电机反馈电流，
-`YM/PM`中`0`表示位置环、`1`表示纯速度环。
+`YC/PC`为实际CAN电流命令，`YTC/PTC`为电机反馈电流。
 
 融合状态`S`：
 
@@ -260,8 +274,7 @@ IMU,CONFIG_ERROR,ACC=0x1E,GYRO=0x0F,CFG=GYRO:0x10,W=0x02,R=0x82,ERR=0
 
 ## DBUS 云台控制
 
-当前`GIMBAL_YAW_ONLY_TEST_MODE=0U`，启用Yaw和Pitch双轴位置控制。
-以上板开发板为视角，Yaw通过CAN1、Pitch通过CAN2通信，两台
+当前启用Yaw和Pitch双轴位置控制。以上板开发板为视角，Yaw通过CAN1、Pitch通过CAN2通信，两台
 GM6020均为ID 2。上电分别采集100帧零点后，CH0控制Yaw、CH1控制Pitch：
 
 | 通道 | 动作 | 满杆目标速度 |
@@ -281,8 +294,6 @@ GM6020均为ID 2。上电分别采集100帧零点后，CH0控制Yaw、CH1控制P
 当前实机方向修正为Yaw `-1.0f`、Pitch `-1.0f`。如果后续更改电机安装
 方向，可修改`remote_gimbal_control.c`中的
 `REMOTE_GIMBAL_YAW_DIRECTION`或`REMOTE_GIMBAL_PITCH_DIRECTION`。
-需要重新进行Yaw单轴测试时，可暂时把
-`GIMBAL_YAW_ONLY_TEST_MODE`改回`1U`。
 
 遥控位置轨迹同时提交目标速度前馈，首次装机时Yaw/Pitch增益均为保守的
 `0.25`；确认方向和电流响应后再按`0.25 → 0.5 → 1.0`逐步增加。到达
@@ -296,7 +307,7 @@ Iff = A*sin(angle) + B*cos(angle) + C
 
 重力、摩擦、速度、加速度及Pitch底座扰动前馈系数当前均为0，必须使用
 实机日志辨识后在`gimbal_params.h`中逐项启用。PID与前馈的总电流统一
-限幅并参与anti-windup；急停、故障、速度调试模式和反馈源切换都会清空
+限幅并参与anti-windup；急停、故障和反馈源切换都会清空
 旧前馈。
 
 当前还启用了临时S1安全映射：
@@ -459,11 +470,9 @@ CAN1与Yaw电机共享物理总线；底盘模块每10 ms发送两帧，不接�
 | `Core/Src/freertos.c` | 1 ms云台任务、1 ms IMU任务、10 ms USART6调试任务及RTOS钩子 |
 | `Core/Src/bmi088.c` | BMI088初始化、寄存器配置和六轴原始数据采集 |
 | `Core/Src/uart_debug.c` | USART6云台、RC、底盘、BMI088及Pitch融合统一调试输出 |
-| `Core/Src/bmi088_monitor.c` | 保留的USB CDC BMI088旧监视模块，当前任务未调用 |
 | `Core/Src/pitch_fusion.c` | Pitch静止标定、二维Kalman和受限闭环反馈 |
-| `Core/Src/control_input.c` | USB CDC双轴串口指令解析 |
+| `Core/Src/control_input.c` | MiniPC/上位机Micro-USB CDC命令输入与状态输出扩展点 |
 | `Core/Src/dbus.c` | DBUS DMA接收、摇杆解包、校验与在线判断 |
-| `Core/Src/dbus_monitor.c` | 保留的USB CDC遥控器旧监视模块，当前任务未调用 |
 | `Core/Src/remote_gimbal_control.c` | DBUS摇杆死区、速度映射与目标位置积分 |
 | `Core/Src/gimbal_calibration.c` | 上电采样、传感器零位设置及Pitch慢速回零 |
 | `Core/Src/chassis_can.c` | CAN1底盘双帧编码和周期发送 |
@@ -501,9 +510,8 @@ cmake --build --preset Debug --target CAN
 3. 根据机械结构设置Yaw、Pitch软限位。
 4. 检查 `Core/Inc/config/pitch_fusion_config.h`中的BMI088轴向、Pitch
    编码器方向和融合闭环限制。
-5. 检查 `Core/Src/main.c` 中的 `SPEED_LOOP_DEBUG_BOOT_ENABLE`：
-   - `0U`：正常位置控制；
-   - `1U`：上电进入固定转速调试。
+5. 与视觉组联调前共同确定Micro-USB CDC瞄准/开火报文、控制权优先级和
+   开火安全联锁，再从`control_in()/control_out()`扩展。
 
-当前版本该开关为`0U`，不会上电进入固定转速调试。装机运行前仍需确认
+装机运行前仍需确认
 云台活动范围、急停方式、BMI088方向和Pitch融合限制。

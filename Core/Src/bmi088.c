@@ -146,6 +146,7 @@ static HAL_StatusTypeDef bmi088_accel_read_register(
       0U
   };
   uint8_t rx[3] = {0U, 0U, 0U};
+      /* 加速度计读操作的第2个字节是dummy，真正数据在rx[2]。 */
   HAL_StatusTypeDef status;
 
   if ((bmi088_spi == NULL) || (value == NULL))
@@ -188,6 +189,7 @@ static HAL_StatusTypeDef bmi088_gyro_read_register(
       0U
   };
   uint8_t rx[2] = {0U, 0U};
+      /* 陀螺仪没有加速度计那样的额外dummy字节，数据在rx[1]。 */
   HAL_StatusTypeDef status;
 
   if ((bmi088_spi == NULL) || (value == NULL))
@@ -341,6 +343,7 @@ static HAL_StatusTypeDef bmi088_accel_read_burst(
 {
   uint8_t tx[BMI088_ACCEL_BURST_LENGTH] = {0U};
   uint8_t rx[BMI088_ACCEL_BURST_LENGTH] = {0U};
+      /* 本项目最大读取6字节数据，前面保留地址和dummy两个字节。 */
   HAL_StatusTypeDef status;
 
   if ((data == NULL)
@@ -380,6 +383,7 @@ static HAL_StatusTypeDef bmi088_gyro_read_burst(
 {
   uint8_t tx[BMI088_GYRO_BURST_LENGTH] = {0U};
   uint8_t rx[BMI088_GYRO_BURST_LENGTH] = {0U};
+      /* 陀螺仪突发读只保留地址字节，后面是6字节XYZ数据。 */
   HAL_StatusTypeDef status;
 
   if ((data == NULL)
@@ -560,8 +564,11 @@ BMI088_Status_t BMI088_Init(SPI_HandleTypeDef *spi)
 bool BMI088_ReadSample(void)
 {
   uint8_t accel_data[6];
+      /* 加速度 X/Y/Z，各2字节，小端序。 */
   uint8_t gyro_data[6];
+      /* 陀螺仪 X/Y/Z，各2字节，小端序。 */
   BMI088_Sample_t sample;
+      /* 先在局部组装完整样本，最后一次性发布，避免读者看到半成品。 */
 
   if (diagnostic.status != BMI088_STATUS_OK)
   {
@@ -595,6 +602,7 @@ bool BMI088_ReadSample(void)
   sample.gyro_raw[2] =
       bmi088_decode_le_i16(gyro_data[4], gyro_data[5]);
 
+  /* 采样序号由驱动维护，不依赖HAL tick，便于判断是否有新样本。 */
   sample.sample_count = latest_sample.sample_count + 1U;
   if (!temperature_valid
       || ((sample.sample_count % BMI088_TEMP_READ_DIVIDER) == 0U))

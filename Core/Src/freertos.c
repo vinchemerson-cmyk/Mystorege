@@ -58,6 +58,7 @@
  *   control_out()                           GM6020_Process()
  *   ChassisCAN_Process()                    GimbalCalibration_Process() ← 新增
  *                                           RemoteGimbalControl_Process() ← 新增
+ *                                           control_out()
  *                                           ChassisCAN_Process()
  *
  * 【FreeRTOS 钩子函数 (Hook Functions)】
@@ -247,7 +248,8 @@ void StartGimbalTask(void *argument)
    *   6. RemoteGimbalControl_Process() — 摇杆、摩擦轮和拨弹联锁
    *   7. DualM3508_Process()           — CAN2 FIFO1双摩擦轮速度环
    *   8. FeederMotor_Process()         — CAN1 FIFO1反馈与拨弹盘速度环
-   *   9. ChassisCAN_Process()          — 内部节流 (10 ms=100 Hz)
+   *   9. control_out()                 — USB CDC状态反馈，预留给MiniPC/视觉
+   *  10. ChassisCAN_Process()          — 内部节流 (10 ms=100 Hz)
    *
    * 调试数据已移到低优先级uartDebugTask，不占用本控制任务发送时间。
    */
@@ -261,7 +263,7 @@ void StartGimbalTask(void *argument)
     RemoteGimbalControl_Process();
     DualM3508_Process();
     FeederMotor_Process();
-    /* control_out(); */  /* DBUS 调试期间暂停周期 FB 上报 (暂停后可减小 USB 带宽占用) */
+    control_out();
     ChassisCAN_Process();
 
     /* 绝对延迟 1 ms — 与下一拍唤醒时间对齐，不累积漂移 */

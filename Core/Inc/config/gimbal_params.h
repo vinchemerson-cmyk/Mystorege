@@ -156,25 +156,8 @@
 #define PITCH_MAX_ANGLE_DEG             15.5f    /* 最大俯仰角度 — 低头 (look down) */
 
 /*===================== 公共安全参数 (Common Safety Parameters) =====================*/
-/*
- * Yaw 单轴装机测试模式：
- *   1 = CH0直接映射为Yaw目标转速，只运行速度环；
- *       同时禁止Pitch遥控并强制0x1FE的Pitch电流槽为0；
- *   0 = 启用Yaw和Pitch逐轴独立标定、在线检查及遥控控制。
- */
-#define GIMBAL_YAW_ONLY_TEST_MODE       0U
-
-/*
- * Yaw单轴速度环调试时的遥控器满杆目标转速。
- * 电机控制层仍会执行GM6020_DEBUG_SPEED_LIMIT_RPM硬限幅。
- */
-#define YAW_REMOTE_SPEED_DEBUG_MAX_RPM  100.0f
-
 /* 反馈超时阈值：100ms 内未收到有效 CAN 反馈 → FAULT 状态 → 输出零电流 */
 #define GM6020_FEEDBACK_TIMEOUT_MS      100U     /* 反馈超时 — feedback timeout (ms) */
-
-/* 速度调试模式转速硬限幅：±200 RPM (GM6020 额定转速约 300 RPM) */
-#define GM6020_DEBUG_SPEED_LIMIT_RPM    200.0f   /* 调试转速上限 — debug speed limit (rpm) */
 
 /* 位置轨迹前馈接口的公共安全限制。 */
 #define GM6020_POSITION_FF_ACCEL_LIMIT_RPM_S 2000.0f

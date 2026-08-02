@@ -5,13 +5,17 @@
  * ===========================================================================
  *
  * 【模块定位】
- *   本模块是上位机与 MCU 之间的串口协议层，负责：
+ *   本模块是MiniPC/上位机与MCU之间的USB CDC协议层，负责：
  *     输入 (control_in):  解析上位机下发的角度目标命令或急停命令，
  *                          并分发给云台、底盘和拨弹盘模块
  *     输出 (control_out): 周期上报双轴角度、转速、在线状态和急停状态
  *
+ *   后续视觉联调仍从control_in()/control_out()扩展瞄准、开火和机器人状态
+ *   报文。协议字段和DBUS/视觉控制权仲裁尚未确定，因此当前只保留稳定的
+ *   双轴角度及安全命令，不提前定义开火格式。
+ *
  * 【串口拓扑】
- *   USB OTG FS (PA11/PA12) → CDC 虚拟串口 → 上位机 (PuTTY/串口助手/自定义上位机)
+ *   USB OTG FS (PA11/PA12) → Micro-USB CDC虚拟串口 → MiniPC/上位机
  *   波特率由 USB FS 协议协商，与 USART6 硬件串口独立。
  *
  * 【接收机制】
@@ -27,7 +31,7 @@
  *     "<Yaw角度>,<Pitch角度>\r\n"  — 设置双轴目标角度
  *       例: "123.45,-15.30\r\n"    — Yaw 123.45°, Pitch -15.30°
  *         Yaw 范围:  ±36000° (累计多圈)
- *         Pitch 范围: -31.0°~+18.5° (单圈位置)
+ *         Pitch 范围: 使用 config/gimbal_params.h 中的运行软限位
  *     "ESTOP\r\n"                  — 锁存式急停（不区分大小写）
  *     "CLEAR\r\n"                  — 解除急停（严格区分大小写）
  *     "CALSTATUS\r\n"              — 查询上电自动标定状态（可选）
@@ -146,6 +150,8 @@ static uint8_t calibration_error_reply[] = "CALERROR\r\n";
 /* 反馈上报缓冲区与时间戳 */
 static uint8_t feedback_reply[CONTROL_OUT_BUFFER_CAPACITY]; /* 反馈帧格式化缓冲区 */
 static uint32_t last_feedback_tx_ms;                        /* 上次上报时间戳 — last feedback timestamp */
+static uint16_t feedback_reply_length;                      /* 待发送反馈帧长度 */
+static bool feedback_reply_pending;                         /* USB忙时保留反馈，后续重试 */
 
 /*
  * 恢复中断状态。
@@ -483,27 +489,27 @@ void control_in(void)
   {
     switch (GimbalCalibration_GetStatus())
     {
-      case GIMBAL_CALIBRATION_CALIBRATED:
+      case GIMBAL_CALIBRATION_CALIBRATED://采样结果已应用到当前运行时坐标；本工程不写入Flash。
         pending_ack = CONTROL_ACK_CALIBRATED;
         break;
 
-      case GIMBAL_CALIBRATION_WAITING_FEEDBACK:
+      case GIMBAL_CALIBRATION_WAITING_FEEDBACK://等待反馈：刚上电或反馈暂时离线。
         pending_ack = CONTROL_ACK_CALWAIT;
         break;
 
-      case GIMBAL_CALIBRATION_WAITING_STILL:
+      case GIMBAL_CALIBRATION_WAITING_STILL://等待静止：检测到云台还在运动，样本不能使用。
         pending_ack = CONTROL_ACK_CALMOVING;
         break;
 
-      case GIMBAL_CALIBRATION_SAMPLING:
+      case GIMBAL_CALIBRATION_SAMPLING://正在收集满足静止条件的新样本。
         pending_ack = CONTROL_ACK_CALIBRATING;
         break;
 
-      case GIMBAL_CALIBRATION_RETURNING_ZERO:
+      case GIMBAL_CALIBRATION_RETURNING_ZERO://Pitch正在以受限速度回到传感器定义的0°。
         pending_ack = CONTROL_ACK_CALHOMING;
         break;
 
-      case GIMBAL_CALIBRATION_ERROR:
+      case GIMBAL_CALIBRATION_ERROR://标定或自动回零的安全检查失败。
         pending_ack = CONTROL_ACK_CALERROR;
         break;
 
@@ -650,6 +656,17 @@ void control_out(void)
   char pitch_angle[20];
   int length;
 
+  /* USB端点忙时保留静态缓冲区内容，下一拍优先重试，避免状态帧被丢弃。 */
+  if (feedback_reply_pending)
+  {
+    if (CDC_Transmit_FS(
+            feedback_reply, feedback_reply_length) == USBD_OK)
+    {
+      feedback_reply_pending = false;
+    }
+    return;
+  }
+
   if ((uint32_t)(now - last_feedback_tx_ms)
       < CONTROL_OUT_PERIOD_MS)
   {
@@ -699,6 +716,12 @@ void control_out(void)
   if ((length > 0)
       && ((uint32_t)length < sizeof(feedback_reply)))
   {
-    (void)CDC_Transmit_FS(feedback_reply, (uint16_t)length);
+    feedback_reply_length = (uint16_t)length;
+    feedback_reply_pending = true;
+    if (CDC_Transmit_FS(
+            feedback_reply, feedback_reply_length) == USBD_OK)
+    {
+      feedback_reply_pending = false;
+    }
   }
 }
